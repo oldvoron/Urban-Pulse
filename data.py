@@ -1,6 +1,37 @@
 import osmnx as ox
 import pandas as pd
 import geopandas as gpd
+import time
+
+
+def configure_osmnx():
+    """Configure osmnx with retry-friendly settings."""
+    ox.settings.timeout = 180
+    ox.settings.max_query_area_size = 50_000_000_000
+    ox.settings.overpass_rate_limit = False
+    ox.settings.overpass_url = "https://overpass-api.de/api/interpreter"
+
+
+configure_osmnx()
+
+
+def osmnx_fetch_with_retry(fetch_func, max_retries=3, delay=3):
+    """Retry osmnx fetch with exponential backoff on connection errors (max ~9s total wait)."""
+    for attempt in range(max_retries):
+        try:
+            result = fetch_func()
+            time.sleep(2)
+            return result
+        except Exception as e:
+            err_str = str(e)
+            if any(k in err_str for k in ('Connection refused', 'Max retries', 'timeout', 'Timeout')):
+                if attempt < max_retries - 1:
+                    wait = delay * (attempt + 1)
+                    print(f"[OSM] Connection failed, retrying in {wait}s... (attempt {attempt+1}/{max_retries})")
+                    time.sleep(wait)
+                    continue
+            raise e
+    return None
 
 
 # ── Overture Maps ─────────────────────────────────────────────────────────────
@@ -103,10 +134,12 @@ def fetch_overture_pois(city_name: str, bbox=None) -> pd.DataFrame:
 # osmnx 2.x: bbox = (left, bottom, right, top) = (min_lon, min_lat, max_lon, max_lat)
 
 def _osm_features(city_name: str, bbox, tags: dict) -> gpd.GeoDataFrame:
-    """Call features_from_bbox (when bbox given) or features_from_place."""
+    """Call features_from_bbox (when bbox given) or features_from_place, with retry."""
     if bbox is not None:
-        return ox.features_from_bbox(bbox=bbox, tags=tags)
-    return ox.features_from_place(city_name, tags=tags)
+        result = osmnx_fetch_with_retry(lambda: ox.features_from_bbox(bbox=bbox, tags=tags))
+    else:
+        result = osmnx_fetch_with_retry(lambda: ox.features_from_place(city_name, tags=tags))
+    return result if result is not None else gpd.GeoDataFrame()
 
 
 # ── Street network & buildings ────────────────────────────────────────────────
@@ -121,18 +154,21 @@ def fetch_osm_data(city_name: str, bbox=None) -> dict:
     # Street network
     try:
         if bbox is not None:
-            G = ox.graph_from_bbox(bbox=bbox, network_type="walk")
+            G = osmnx_fetch_with_retry(lambda: ox.graph_from_bbox(bbox=bbox, network_type="walk"))
         else:
-            G = ox.graph_from_place(city_name, network_type="walk")
+            G = osmnx_fetch_with_retry(lambda: ox.graph_from_place(city_name, network_type="walk"))
+        if G is None:
+            raise ValueError("graph fetch returned None after retries")
         result["graph"] = G
         print(f"[OSM] Street network: {len(G.nodes)} nodes, {len(G.edges)} edges")
     except Exception as e:
         print(f"[OSM] Street network failed: {e}")
         try:
             loc = ox.geocode(city_name)
-            G = ox.graph_from_point(loc, dist=3000, network_type="walk")
-            result["graph"] = G
-            print(f"[OSM] Fallback point network: {len(G.nodes)} nodes")
+            G = osmnx_fetch_with_retry(lambda: ox.graph_from_point(loc, dist=3000, network_type="walk"))
+            if G is not None:
+                result["graph"] = G
+                print(f"[OSM] Fallback point network: {len(G.nodes)} nodes")
         except Exception as e2:
             print(f"[OSM] Fallback network failed: {e2}")
 
@@ -431,16 +467,21 @@ def fetch_admin_boundaries(city_name: str) -> dict:
     """Fetch city + district boundaries via OSM admin_level tags."""
     result = {}
     try:
-        result["city"] = ox.geocode_to_gdf(city_name)
+        result["city"] = osmnx_fetch_with_retry(lambda: ox.geocode_to_gdf(city_name))
     except Exception:
         result["city"] = None
 
     for admin_level in [9, 10]:
         try:
-            gdf = ox.features_from_place(
-                city_name,
-                tags={"boundary": "administrative", "admin_level": str(admin_level)},
+            gdf = osmnx_fetch_with_retry(
+                lambda al=admin_level: ox.features_from_place(
+                    city_name,
+                    tags={"boundary": "administrative", "admin_level": str(al)},
+                )
             )
+            if gdf is None:
+                result[f"admin_{admin_level}"] = None
+                continue
             if not gdf.empty:
                 gdf = gdf[gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])].copy()
                 if not gdf.empty:

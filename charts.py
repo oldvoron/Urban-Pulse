@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 from shapely.geometry import Polygon
 
 MORPHOTYPE_COLORS = {
@@ -62,7 +63,7 @@ def compute_zoom_level(gdf) -> float:
         return 11.0
 
 
-def hex_to_polygon_gdf(hex_df) -> gpd.GeoDataFrame:
+def hex_to_polygon_gdf(hex_df, city_polygon=None) -> gpd.GeoDataFrame:
     """Convert H3 cell IDs in any DataFrame to Shapely Polygon geometries."""
     if hex_df is None or (hasattr(hex_df, "empty") and hex_df.empty):
         return gpd.GeoDataFrame()
@@ -81,7 +82,14 @@ def hex_to_polygon_gdf(hex_df) -> gpd.GeoDataFrame:
             pass
     if not rows:
         return gpd.GeoDataFrame()
-    return gpd.GeoDataFrame(rows, crs="EPSG:4326")
+    gdf = gpd.GeoDataFrame(rows, crs="EPSG:4326")
+    if city_polygon is not None:
+        try:
+            city_gdf = gpd.GeoDataFrame(geometry=[city_polygon], crs="EPSG:4326")
+            gdf = gpd.clip(gdf, city_gdf)
+        except Exception:
+            pass
+    return gdf
 
 
 def _choropleth_hex(
@@ -93,6 +101,7 @@ def _choropleth_hex(
     mapbox_style: str = "carto-positron",
     hover_cols: list = None,
     height: int = 450,
+    city_polygon=None,
 ) -> go.Figure:
     """Build a choropleth_mapbox figure from any DataFrame with an h3_cell column."""
     if hex_df is None or (hasattr(hex_df, "empty") and hex_df.empty):
@@ -102,7 +111,7 @@ def _choropleth_hex(
     if color_col not in hex_df.columns:
         return _empty(f"Missing column '{color_col}' for: {title}", height)
 
-    poly_gdf = hex_to_polygon_gdf(hex_df)
+    poly_gdf = hex_to_polygon_gdf(hex_df, city_polygon=city_polygon)
     if poly_gdf.empty:
         return _empty(f"Hex polygon conversion failed for: {title}", height)
 
@@ -134,7 +143,7 @@ def _choropleth_hex(
         mapbox_style=mapbox_style,
         zoom=zoom,
         center={"lat": center_lat, "lon": center_lon},
-        opacity=0.75,
+        opacity=0.45,
     )
     if colorscale is not None and color_discrete_map is None:
         px_kwargs["color_continuous_scale"] = colorscale
@@ -173,38 +182,77 @@ def chart_poi_distribution(category_series: pd.Series) -> go.Figure:
         return _empty("No POI data available")
     df = category_series.reset_index()
     df.columns = ["category", "count"]
-    df = df.sort_values("count")
-    n = len(df)
-    colors = px.colors.sample_colorscale("Teal", [i / max(n - 1, 1) for i in range(n)])
+    df["category"] = df["category"].str.replace("_", " ").str.title()
+    total = df["count"].sum()
+    threshold = total * 0.01
+    main = df[df["count"] >= threshold].copy()
+    other_count = int(df[df["count"] < threshold]["count"].sum())
+    if other_count > 0:
+        main = pd.concat([main, pd.DataFrame([{"category": "Other", "count": other_count}])],
+                         ignore_index=True)
+    main = main.sort_values("count")
+    n = len(main)
+    _teal = ["#1a6b8a", "#1e7da0", "#268fb5", "#2ea3ca", "#40b5d8",
+             "#5ec3e0", "#80d3e8", "#a8d8ea"]
+    colors = [_teal[int(i / max(n - 1, 1) * (len(_teal) - 1))] for i in range(n)]
     fig = go.Figure(go.Bar(
-        x=df["count"], y=df["category"], orientation="h",
-        marker_color=colors, text=df["count"], textposition="outside",
+        x=main["count"], y=main["category"], orientation="h",
+        marker_color=colors, text=main["count"], textposition="outside",
     ))
     fig.update_layout(
         title="Top POI Categories", xaxis_title="Count", yaxis_title="Category",
         template="plotly_white", height=450, margin=dict(l=10, r=40, t=50, b=40),
+        font=_FONT, title_font=_TITLE_FONT,
     )
     return fig
 
 
 def chart_building_heights(buildings_gdf: gpd.GeoDataFrame) -> go.Figure:
     if buildings_gdf.empty or "height" not in buildings_gdf.columns:
-        return _empty("No building height data available", 400)
+        return _empty("No building height data available", 700)
     heights = pd.to_numeric(buildings_gdf["height"], errors="coerce").dropna()
     heights = heights[heights <= 200]
     if heights.empty:
-        return _empty("No valid building heights found", 400)
+        return _empty("No valid building heights found", 700)
     median_h = float(heights.median())
     p75_h = float(heights.quantile(0.75))
-    fig = go.Figure()
-    fig.add_trace(go.Histogram(x=heights, nbinsx=40, marker_color="#2196F3", opacity=0.8))
+    fig = make_subplots(rows=2, cols=1,
+                        subplot_titles=("Height Distribution", "Height vs Footprint Area"),
+                        vertical_spacing=0.12)
+    fig.add_trace(go.Histogram(x=heights, nbinsx=40, marker_color="#2196F3", opacity=0.8,
+                               name="Count"), row=1, col=1)
+    try:
+        b = buildings_gdf.copy()
+        if b.crs is None:
+            b = b.set_crs("EPSG:4326")
+        b_m = b.to_crs("EPSG:3857")
+        area = b_m.geometry.area
+        h_vals = pd.to_numeric(b_m["height"], errors="coerce")
+        mask = h_vals.notna() & (h_vals <= 200) & (area > 0)
+        h_s, a_s = h_vals[mask], area[mask]
+        if not h_s.empty:
+            fig.add_trace(go.Scatter(
+                x=a_s, y=h_s, mode="markers",
+                marker=dict(size=3, color=h_s, colorscale="Viridis", opacity=0.4,
+                            showscale=True, colorbar=dict(title="Height (m)", x=1.02)),
+                hovertemplate="Area: %{x:.0f} m²<br>Height: %{y:.1f} m<extra></extra>",
+                name="Buildings",
+            ), row=2, col=1)
+    except Exception:
+        pass
     fig.add_vline(x=median_h, line_dash="dash", line_color="#E91E63",
-                  annotation_text=f"Median: {median_h:.1f}m", annotation_position="top right")
+                  annotation_text=f"Median: {median_h:.1f}m", annotation_position="top right",
+                  row=1, col=1)
     fig.add_vline(x=p75_h, line_dash="dot", line_color="#FF9800",
-                  annotation_text=f"P75: {p75_h:.1f}m", annotation_position="top left")
+                  annotation_text=f"P75: {p75_h:.1f}m", annotation_position="top left",
+                  row=1, col=1)
+    fig.update_xaxes(title_text="Height (m)", row=1, col=1)
+    fig.update_yaxes(title_text="Count", row=1, col=1)
+    fig.update_xaxes(title_text="Footprint Area (m²)", row=2, col=1)
+    fig.update_yaxes(title_text="Height (m)", row=2, col=1)
     fig.update_layout(
-        title="Building Height Distribution", xaxis_title="Height (m)", yaxis_title="Count",
-        template="plotly_white", height=400, showlegend=False,
+        title="Building Height Analysis", template="plotly_white", height=700,
+        showlegend=False, font=_FONT, title_font=_TITLE_FONT,
     )
     return fig
 
@@ -216,8 +264,14 @@ def chart_street_network_radar(stats_dict: dict, city_name: str) -> go.Figure:
     block_size_score   = max(0.0, 1.0 - (stats_dict.get("avg_street_length", 200) / 400.0))
     intersection_dens  = min(stats_dict.get("intersection_count", 0) / 5000.0, 1.0)
     network_efficiency = max(0.0, 1.0 - (stats_dict.get("circuity_avg", 1.0) - 1.0))
-    categories = ["Connectivity", "Block Size Score", "Intersection Density", "Network Efficiency"]
-    values = [connectivity, block_size_score, intersection_dens, network_efficiency]
+    dead_end_score     = max(0.0, 1.0 - stats_dict.get("dead_end_ratio", 0.0))
+    entropy_score      = min(stats_dict.get("orientation_entropy", 0.0) / 3.5, 1.0)
+    pct_major          = stats_dict.get("pct_major_roads", 0.0)
+    hierarchy_score    = min(pct_major / 0.3, 1.0) if pct_major else 0.3
+    categories = ["Connectivity", "Block Size Score", "Intersection Density", "Network Efficiency",
+                  "No Dead-Ends", "Orientation Entropy", "Street Hierarchy"]
+    values = [connectivity, block_size_score, intersection_dens, network_efficiency,
+              dead_end_score, entropy_score, hierarchy_score]
     fig = go.Figure(go.Scatterpolar(
         r=values + [values[0]], theta=categories + [categories[0]],
         fill="toself", fillcolor="rgba(33,150,243,0.25)",
@@ -227,6 +281,7 @@ def chart_street_network_radar(stats_dict: dict, city_name: str) -> go.Figure:
         title=f"Street Network Profile — {city_name}",
         polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
         template="plotly_white", height=400, showlegend=False,
+        font=_FONT, title_font=_TITLE_FONT,
     )
     return fig
 
@@ -242,7 +297,22 @@ def chart_landuse_composition(landuse_dict: dict) -> go.Figure:
         labels=labels, values=values, hole=0.4,
         marker=dict(colors=marker_colors), textinfo="label+percent",
     ))
-    fig.update_layout(title="Land Use Composition", template="plotly_white", height=400)
+    green_pct = sum(percentages.get(k, 0) for k in ["park", "forest"])
+    if green_pct >= 15:
+        bench_text = f"✓ EU green target met ({green_pct:.1f}%)"
+        bench_color = "#27AE60"
+    else:
+        bench_text = f"✗ Below EU 15% green target ({green_pct:.1f}%)"
+        bench_color = "#E74C3C"
+    fig.update_layout(
+        title="Land Use Composition", template="plotly_white", height=400,
+        font=_FONT, title_font=_TITLE_FONT,
+        annotations=[go.layout.Annotation(
+            text=bench_text, xref="paper", yref="paper",
+            x=0.5, y=-0.08, showarrow=False,
+            font=dict(size=12, color=bench_color),
+        )],
+    )
     return fig
 
 
@@ -264,54 +334,6 @@ def chart_street_orientation(orientation_entropy: float, orientation_histogram: 
         title=f"Street Orientation Distribution  (Entropy: {orientation_entropy:.2f})",
         polar=dict(angularaxis=dict(direction="clockwise", rotation=90)),
         template="plotly_white", height=450,
-    )
-    return fig
-
-
-def chart_building_typology(typology_series: pd.Series) -> go.Figure:
-    if typology_series is None or typology_series.empty:
-        return _empty("No building typology data", 300)
-    total = typology_series.sum()
-    typology_pct = (typology_series / total * 100) if total > 0 else typology_series
-    _type_colors = {
-        "detached": "#7FC97F", "semi-detached": "#BEAED4", "terraced": "#FDC086",
-        "block": "#FFFF99", "tower": "#386CB0", "unknown": "#CCCCCC",
-    }
-    fig = go.Figure()
-    for typology, pct in typology_pct.items():
-        fig.add_trace(go.Bar(
-            x=[float(pct)], y=["Buildings"], orientation="h",
-            name=str(typology).replace("-", " ").title(),
-            marker_color=_type_colors.get(str(typology), "#CCCCCC"),
-            text=f"{pct:.1f}%", textposition="inside",
-        ))
-    fig.update_layout(
-        title="Building Typology Distribution", xaxis_title="Percentage (%)",
-        xaxis=dict(range=[0, 100]), barmode="stack", template="plotly_white", height=300,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02),
-    )
-    return fig
-
-
-def chart_cmi_distribution(cmi_gdf) -> go.Figure:
-    if cmi_gdf is None or cmi_gdf.empty:
-        return _empty("No CMI data available")
-    if "CMI" not in cmi_gdf.columns or "cluster" not in cmi_gdf.columns:
-        return _empty("No CMI data available")
-    fig = go.Figure()
-    for cluster_name, color in MORPHOTYPE_COLORS.items():
-        sub = cmi_gdf[cmi_gdf["cluster"] == cluster_name]
-        if sub.empty:
-            continue
-        fig.add_trace(go.Violin(
-            y=sub["CMI"], name=cluster_name.replace("_", " ").title(),
-            box_visible=True, meanline_visible=True,
-            fillcolor=color, line=dict(color=color), opacity=0.7,
-        ))
-    fig.update_layout(
-        title="CMI Distribution by Morphotype Cluster",
-        yaxis_title="Composite Morphological Index",
-        template="plotly_white", height=450, violinmode="overlay",
     )
     return fig
 
@@ -512,74 +534,123 @@ def _quintile_crosstab(hex_gdf, col_x: str, col_y: str, value_col: str = None):
 
 def chart_cross_heatmap_morph_transport(hex_gdf) -> go.Figure:
     if hex_gdf is None or hex_gdf.empty:
-        return _empty("No merged hex data available", 400)
+        return _empty("No merged hex data available", 450)
     if "CMI" not in hex_gdf.columns or "transport_index" not in hex_gdf.columns:
-        return _empty("Need CMI and transport_index columns", 400)
+        return _empty("Need CMI and transport_index columns", 450)
     cross_tab, text = _quintile_crosstab(hex_gdf, "CMI", "transport_index")
     if cross_tab is None:
-        return _empty("Insufficient data for cross-analysis", 400)
-    fig = go.Figure(go.Heatmap(
-        z=cross_tab.values, x=[str(c) for c in cross_tab.columns], y=[str(r) for r in cross_tab.index],
+        return _empty("Insufficient data for cross-analysis", 450)
+    col_sums = cross_tab.values.sum(axis=0)
+    row_sums = cross_tab.values.sum(axis=1)
+    x_labels = [str(c) for c in cross_tab.columns]
+    y_labels = [str(r) for r in cross_tab.index]
+    fig = make_subplots(
+        rows=2, cols=2, column_widths=[0.82, 0.18], row_heights=[0.82, 0.18],
+        shared_xaxes=True, shared_yaxes=True,
+        horizontal_spacing=0.02, vertical_spacing=0.02,
+    )
+    fig.add_trace(go.Heatmap(
+        z=cross_tab.values, x=x_labels, y=y_labels,
         colorscale="Viridis", text=text, texttemplate="%{text}", textfont=dict(size=11),
-        showscale=True, colorbar=dict(title="Cell Count"),
-    ))
+        showscale=True, colorbar=dict(title="Count", x=1.02),
+    ), row=1, col=1)
+    fig.add_trace(go.Bar(
+        x=row_sums, y=y_labels, orientation="h", marker_color="#7B68EE", showlegend=False,
+    ), row=1, col=2)
+    fig.add_trace(go.Bar(
+        x=x_labels, y=col_sums, marker_color="#7B68EE", showlegend=False,
+    ), row=2, col=1)
     fig.update_layout(
         title="Morphology × Transport: Urban Structure Matrix",
-        xaxis_title="Morphological Index (CMI) Quintile →",
-        yaxis_title="Transport Accessibility Quintile →",
-        template="plotly_white", height=400, margin=dict(l=80, r=20, t=60, b=60),
+        template="plotly_white", height=450, margin=dict(l=80, r=60, t=60, b=20),
+        font=_FONT, title_font=_TITLE_FONT,
     )
+    fig.update_xaxes(title_text="CMI Quintile →", row=2, col=1)
+    fig.update_yaxes(title_text="Transport Quintile →", row=1, col=1)
     return fig
 
 
 def chart_cross_heatmap_nature_morph(hex_gdf) -> go.Figure:
     if hex_gdf is None or hex_gdf.empty:
-        return _empty("No merged hex data available", 400)
+        return _empty("No merged hex data available", 450)
     if "green_space_ratio" not in hex_gdf.columns or "FAR" not in hex_gdf.columns:
-        return _empty("Need green_space_ratio and FAR columns", 400)
+        return _empty("Need green_space_ratio and FAR columns", 450)
     cross_tab, text = _quintile_crosstab(hex_gdf, "green_space_ratio", "FAR", value_col="CMI")
     if cross_tab is None:
-        return _empty("Insufficient data for cross-analysis", 400)
-    fig = go.Figure(go.Heatmap(
-        z=cross_tab.values, x=[str(c) for c in cross_tab.columns], y=[str(r) for r in cross_tab.index],
+        return _empty("Insufficient data for cross-analysis", 450)
+    col_sums = cross_tab.values.sum(axis=0)
+    row_sums = cross_tab.values.sum(axis=1)
+    x_labels = [str(c) for c in cross_tab.columns]
+    y_labels = [str(r) for r in cross_tab.index]
+    fig = make_subplots(
+        rows=2, cols=2, column_widths=[0.82, 0.18], row_heights=[0.82, 0.18],
+        shared_xaxes=True, shared_yaxes=True,
+        horizontal_spacing=0.02, vertical_spacing=0.02,
+    )
+    fig.add_trace(go.Heatmap(
+        z=cross_tab.values, x=x_labels, y=y_labels,
         colorscale="RdYlGn", text=text, texttemplate="%{text}", textfont=dict(size=11),
-        showscale=True, colorbar=dict(title="Median CMI"),
-    ))
+        showscale=True, colorbar=dict(title="Median CMI", x=1.02),
+    ), row=1, col=1)
+    fig.add_trace(go.Bar(
+        x=row_sums, y=y_labels, orientation="h", marker_color="#27AE60", showlegend=False,
+    ), row=1, col=2)
+    fig.add_trace(go.Bar(
+        x=x_labels, y=col_sums, marker_color="#27AE60", showlegend=False,
+    ), row=2, col=1)
     fig.update_layout(
         title="Nature × Density: Environmental Quality Matrix",
-        xaxis_title="Green Space Ratio Quintile →",
-        yaxis_title="FAR (Building Density) Quintile →",
-        template="plotly_white", height=400, margin=dict(l=80, r=20, t=60, b=60),
+        template="plotly_white", height=450, margin=dict(l=80, r=60, t=60, b=20),
+        font=_FONT, title_font=_TITLE_FONT,
     )
+    fig.update_xaxes(title_text="Green Space Ratio Quintile →", row=2, col=1)
+    fig.update_yaxes(title_text="FAR Quintile →", row=1, col=1)
     return fig
 
 
 def chart_cross_heatmap_transport_nature(hex_gdf) -> go.Figure:
     if hex_gdf is None or hex_gdf.empty:
-        return _empty("No merged hex data available", 400)
+        return _empty("No merged hex data available", 450)
     if "transit_score" not in hex_gdf.columns and "transport_index" not in hex_gdf.columns:
-        return _empty("Need transit_score or transport_index column", 400)
+        return _empty("Need transit_score or transport_index column", 450)
     if "nature_index" not in hex_gdf.columns:
-        return _empty("Need nature_index column", 400)
+        return _empty("Need nature_index column", 450)
     x_col = "transit_score" if "transit_score" in hex_gdf.columns else "transport_index"
     cross_tab, text = _quintile_crosstab(hex_gdf, x_col, "nature_index")
     if cross_tab is None:
-        return _empty("Insufficient data for cross-analysis", 400)
+        return _empty("Insufficient data for cross-analysis", 450)
+    col_sums = cross_tab.values.sum(axis=0)
+    row_sums = cross_tab.values.sum(axis=1)
+    x_labels = [str(c) for c in cross_tab.columns]
+    y_labels = [str(r) for r in cross_tab.index]
     n_cols, n_rows = len(cross_tab.columns), len(cross_tab.index)
-    fig = go.Figure(go.Heatmap(
-        z=cross_tab.values, x=[str(c) for c in cross_tab.columns], y=[str(r) for r in cross_tab.index],
+    fig = make_subplots(
+        rows=2, cols=2, column_widths=[0.82, 0.18], row_heights=[0.82, 0.18],
+        shared_xaxes=True, shared_yaxes=True,
+        horizontal_spacing=0.02, vertical_spacing=0.02,
+    )
+    fig.add_trace(go.Heatmap(
+        z=cross_tab.values, x=x_labels, y=y_labels,
         colorscale="Blues", text=text, texttemplate="%{text}", textfont=dict(size=11),
-        showscale=True, colorbar=dict(title="Cell Count"),
-    ))
+        showscale=True, colorbar=dict(title="Count", x=1.02),
+    ), row=1, col=1)
+    fig.add_trace(go.Bar(
+        x=row_sums, y=y_labels, orientation="h", marker_color="#3498DB", showlegend=False,
+    ), row=1, col=2)
+    fig.add_trace(go.Bar(
+        x=x_labels, y=col_sums, marker_color="#3498DB", showlegend=False,
+    ), row=2, col=1)
     fig.add_annotation(x=n_cols-1, y=n_rows-1, text="Transit-Rich<br>Green Zones", showarrow=False,
-                       font=dict(color="#27AE60", size=11, family="Arial Black"), xref="x", yref="y")
+                       font=dict(color="#27AE60", size=10, family="Arial Black"), xref="x", yref="y")
     fig.add_annotation(x=0, y=0, text="Urban<br>Stress Zones", showarrow=False,
-                       font=dict(color="#E74C3C", size=11, family="Arial Black"), xref="x", yref="y")
+                       font=dict(color="#E74C3C", size=10, family="Arial Black"), xref="x", yref="y")
     fig.update_layout(
         title="Transit × Nature: Livability Matrix",
-        xaxis_title="Transit Score Quintile →", yaxis_title="Nature Index Quintile →",
-        template="plotly_white", height=400, margin=dict(l=80, r=20, t=60, b=60),
+        template="plotly_white", height=450, margin=dict(l=80, r=60, t=60, b=20),
+        font=_FONT, title_font=_TITLE_FONT,
     )
+    fig.update_xaxes(title_text="Transit Score Quintile →", row=2, col=1)
+    fig.update_yaxes(title_text="Nature Index Quintile →", row=1, col=1)
     return fig
 
 
@@ -675,6 +746,24 @@ def chart_urban_quality_index(hex_gdf_merged) -> go.Figure:
                     line=dict(width=0.3, color="white")),
         hovertemplate="Transport: %{x:.3f}<br>Nature: %{y:.3f}<extra></extra>",
     ))
+    try:
+        m = np.polyfit(df["transport_index"], df["nature_index"], 1)
+        x_line = np.linspace(df["transport_index"].min(), df["transport_index"].max(), 50)
+        y_line = np.polyval(m, x_line)
+        corr = float(np.corrcoef(df["transport_index"], df["nature_index"])[0, 1])
+        fig.add_trace(go.Scatter(
+            x=x_line, y=y_line, mode="lines",
+            line=dict(color="rgba(100,100,100,0.5)", dash="dot", width=1.5),
+            name=f"r={corr:.2f}", showlegend=True,
+        ))
+        fig.add_annotation(
+            x=float(df["transport_index"].max()) * 0.95,
+            y=float(df["nature_index"].max()) * 0.95,
+            text=f"r = {corr:.2f}",
+            showarrow=False, font=dict(size=11, color="#555555"),
+        )
+    except Exception:
+        pass
     fig.add_hline(y=med_n, line_dash="dash", line_color="gray", opacity=0.5)
     fig.add_vline(x=med_t, line_dash="dash", line_color="gray", opacity=0.5)
     for x, y, lbl, clr in [
@@ -689,12 +778,14 @@ def chart_urban_quality_index(hex_gdf_merged) -> go.Figure:
         title="Urban Quality Index: Transport vs Nature",
         xaxis_title="Transport Accessibility Index", yaxis_title="Nature Index",
         template="plotly_white", height=450,
+        font=_FONT, title_font=_TITLE_FONT,
     )
     return fig
 
 
 def chart_density_gradient(buildings_gdf: gpd.GeoDataFrame,
-                            city_center_lat: float, city_center_lon: float) -> go.Figure:
+                            city_center_lat: float, city_center_lon: float,
+                            poi_df=None) -> go.Figure:
     if buildings_gdf is None or buildings_gdf.empty:
         return _empty("No building data for density gradient")
     if "height" not in buildings_gdf.columns:
@@ -718,6 +809,10 @@ def chart_density_gradient(buildings_gdf: gpd.GeoDataFrame,
     max_h = bh["smooth"].max() if not bh.empty else 1
     norm = bh["smooth"] / max(max_h, 1)
     clrs = [f"rgba({int(20+180*(1-v))},{int(20+60*(1-v))},{int(100+100*(1-v))},0.8)" for v in norm]
+    has_poi = (poi_df is not None and not poi_df.empty
+               and "lat" in poi_df.columns and "lon" in poi_df.columns)
+    layout_kw = dict(yaxis2=dict(title="POI Density", overlaying="y", side="right",
+                                 showgrid=False)) if has_poi else {}
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=bh["dist_m"] / 1000, y=bh["smooth"],
@@ -726,10 +821,28 @@ def chart_density_gradient(buildings_gdf: gpd.GeoDataFrame,
         fillcolor="rgba(52,152,219,0.15)",
         marker=dict(color=clrs, size=6), name="Mean Height",
     ))
+    if has_poi:
+        try:
+            p = poi_df.copy()
+            p_gdf = gpd.GeoDataFrame(geometry=gpd.points_from_xy(p["lon"], p["lat"]),
+                                     crs="EPSG:4326").to_crs("EPSG:3857")
+            p_dist = p_gdf.geometry.distance(center_pt)
+            p_band = (p_dist // 200 * 200).astype(int)
+            poi_counts = p_band.value_counts().sort_index().reset_index()
+            poi_counts.columns = ["dist_m", "poi_count"]
+            fig.add_trace(go.Scatter(
+                x=poi_counts["dist_m"] / 1000, y=poi_counts["poi_count"],
+                mode="lines", line=dict(color="#E74C3C", width=1.5, dash="dot"),
+                name="POI Density", yaxis="y2",
+            ))
+        except Exception:
+            pass
     fig.update_layout(
         title="Urban Density Gradient from City Center",
         xaxis_title="Distance from Center (km)", yaxis_title="Mean Building Height (m)",
         template="plotly_white", height=400,
+        font=_FONT, title_font=_TITLE_FONT,
+        **layout_kw,
     )
     return fig
 
@@ -768,8 +881,9 @@ def chart_landuse_crossref(crossref_df: pd.DataFrame) -> go.Figure:
 def chart_urban_stress_map(stress_gdf) -> go.Figure:
     if stress_gdf is None or stress_gdf.empty or "urban_stress" not in stress_gdf.columns:
         return _empty("No urban stress data available")
-    hover = [c for c in ["urban_stress", "stress_level", "density_stress", "green_deficit",
-                          "transit_deficit", "flood_stress", "mono_stress"] if c in stress_gdf.columns]
+    hover = [c for c in ["urban_stress", "stress_level", "dominant_driver", "density_stress",
+                          "green_deficit", "transit_deficit", "flood_stress", "mono_stress"]
+             if c in stress_gdf.columns]
     return _choropleth_hex(
         stress_gdf, "urban_stress",
         "Urban Stress Index — Composite of 5 Dimensions",
@@ -826,7 +940,13 @@ def chart_opportunity_surface(merged_hex_gdf) -> go.Figure:
     y = _norm(df["nature_index"])
     z = 1.0 - _norm(df["CMI"])
     color_col = _norm(df["urban_stress"]) if "urban_stress" in df.columns else _norm(df.get("diversity_score", x))
-    fig = go.Figure(go.Scatter3d(
+    fig = go.Figure()
+    fig.add_trace(go.Scatter3d(
+        x=x, y=y, z=[0.0] * len(x), mode="markers",
+        marker=dict(size=2, color="rgba(100,100,100,0.2)", showscale=False),
+        hoverinfo="skip", showlegend=False,
+    ))
+    fig.add_trace(go.Scatter3d(
         x=x, y=y, z=z, mode="markers",
         marker=dict(size=4, color=color_col, colorscale="RdYlGn_r",
                     showscale=True, colorbar=dict(title="Stress"), opacity=0.75),
@@ -991,31 +1111,6 @@ def chart_segregation_map(seg_gdf) -> go.Figure:
     )
 
 
-def chart_segregation_profile(seg_gdf, fabric_gdf=None) -> go.Figure:
-    if seg_gdf is None or seg_gdf.empty or "segregation_score" not in seg_gdf.columns:
-        return _empty("No segregation data available")
-    df = seg_gdf.copy()
-    if "compactness" not in df.columns and fabric_gdf is not None and not fabric_gdf.empty:
-        if "compactness" in fabric_gdf.columns and "h3_cell" in df.columns and "h3_cell" in fabric_gdf.columns:
-            df = df.merge(fabric_gdf[["h3_cell", "compactness"]].drop_duplicates("h3_cell"),
-                          on="h3_cell", how="left")
-    if "compactness" not in df.columns:
-        return _empty("Need compactness column for segregation profile")
-    df = df[["compactness", "segregation_score"]].dropna()
-    if df.empty: return _empty("No data for segregation profile")
-    _comp_colors = {"sprawl": "#95A5A6", "low": "#82E0AA", "medium": "#F0B27A", "compact": "#E74C3C"}
-    fig = go.Figure()
-    for comp in _COMP_ORDER:
-        sub = df[df["compactness"] == comp]["segregation_score"]
-        if sub.empty: continue
-        fig.add_trace(go.Box(y=sub, name=comp.title(),
-                             marker_color=_comp_colors.get(comp, "#AAAAAA"), boxmean=True))
-    fig.update_layout(
-        title="Segregation Score by Urban Fabric Type",
-        xaxis_title="Compactness Group", yaxis_title="Segregation Score",
-        template="plotly_white", height=450,
-    )
-    return fig
 
 
 # ── Module 6: Morphotype Radar Comparison ────────────────────────────────────
@@ -1340,7 +1435,7 @@ def chart_heat_island_map(hex_gdf, base_temp: float) -> go.Figure:
             color='uhi_delta',
             color_continuous_scale='RdYlBu_r',
             mapbox_style='carto-darkmatter',
-            opacity=0.75,
+            opacity=0.45,
             zoom=zoom,
             center={'lat': center_lat, 'lon': center_lon},
             hover_data={c: True for c in hover_cols if c in plot_df.columns},
@@ -1359,39 +1454,6 @@ def chart_heat_island_map(hex_gdf, base_temp: float) -> go.Figure:
     return fig
 
 
-def chart_climate_summary(climate_data: dict) -> go.Figure:
-    if not climate_data or 'error' in climate_data:
-        return _empty("No climate data available", 400)
-    daily = climate_data.get('raw_daily', {})
-    dates = daily.get('time', [])
-    temp_max = daily.get('temperature_2m_max', [])
-    temp_min = daily.get('temperature_2m_min', [])
-    precip = daily.get('precipitation_sum', [])
-    if not dates:
-        return _empty("No daily climate data", 400)
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        x=dates, y=precip, name='Precipitation (mm)',
-        marker_color='#3498DB', opacity=0.7, yaxis='y2',
-    ))
-    fig.add_trace(go.Scatter(
-        x=dates, y=temp_max, name='Max Temp (°C)', mode='lines+markers',
-        line=dict(color='#E74C3C', width=2), marker=dict(size=5),
-    ))
-    fig.add_trace(go.Scatter(
-        x=dates, y=temp_min, name='Min Temp (°C)', mode='lines+markers',
-        line=dict(color='#3498DB', width=2, dash='dot'), marker=dict(size=5),
-    ))
-    fig.update_layout(
-        title='7-Day Climate Conditions',
-        xaxis_title='Date',
-        yaxis=dict(title='Temperature (°C)', side='left', color='#E74C3C'),
-        yaxis2=dict(title='Precipitation (mm)', side='right', overlaying='y', color='#3498DB'),
-        template='plotly_white', height=400,
-        legend=dict(orientation='h', yanchor='bottom', y=1.02),
-        font=_FONT, title_font=_TITLE_FONT,
-    )
-    return fig
 
 
 # ── District Scorecard ────────────────────────────────────────────────────────
@@ -1403,7 +1465,11 @@ def chart_district_scorecard(scores_df: pd.DataFrame) -> go.Figure:
     if not grade_cols:
         return _empty("No grade columns found", 400)
     display_cols = [c.replace('_grade', '').title() for c in grade_cols]
-
+    _grade_order = {"A": 0, "B": 1, "C": 2, "D": 3}
+    if "overall_grade" in scores_df.columns:
+        scores_df = scores_df.copy()
+        scores_df["_sort_key"] = scores_df["overall_grade"].map(_grade_order).fillna(4)
+        scores_df = scores_df.sort_values("_sort_key").drop(columns=["_sort_key"])
     z_text, z_colors = [], []
     for _, row in scores_df.iterrows():
         row_text, row_colors = [], []
@@ -1428,6 +1494,7 @@ def chart_district_scorecard(scores_df: pd.DataFrame) -> go.Figure:
     ))
     fig.update_layout(
         title='District Scorecard',
+        title_subtitle_text='Sorted by overall performance',
         height=max(300, len(scores_df) * 40 + 100),
         template='plotly_white',
         xaxis=dict(side='top'),
@@ -1437,23 +1504,359 @@ def chart_district_scorecard(scores_df: pd.DataFrame) -> go.Figure:
     return fig
 
 
-# ── Population Density ────────────────────────────────────────────────────────
+# ── New charts (Part 4) ───────────────────────────────────────────────────────
 
-def chart_population_density(merged_hex_gdf) -> go.Figure:
-    if merged_hex_gdf is None or merged_hex_gdf.empty:
-        return _empty("No population data available")
-    if 'pop_density_proxy' not in merged_hex_gdf.columns:
-        return _empty("No population density proxy available")
-    fig = _choropleth_hex(
-        merged_hex_gdf, 'pop_density_proxy',
-        'Population Density Proxy (buildings × occupancy estimate)',
-        colorscale='Oranges',
-        hover_cols=['pop_density_proxy'],
-        mapbox_style='carto-positron',
-    )
-    fig.add_annotation(
-        text='Proxy based on building count × 3.5 persons/unit. Actual census data may differ.',
-        xref='paper', yref='paper', x=0.5, y=-0.05,
-        showarrow=False, font=dict(size=10, color='gray'),
+def chart_poi_density_contour(poi_df, city_polygon=None) -> go.Figure:
+    if poi_df is None or poi_df.empty:
+        return _empty("No POI data for density contour")
+    if "lat" not in poi_df.columns or "lon" not in poi_df.columns:
+        return _empty("POI data missing lat/lon columns")
+    df = poi_df.dropna(subset=["lat", "lon"])
+    if len(df) < 10:
+        return _empty("Insufficient POI data for density contour")
+    if city_polygon is not None:
+        try:
+            from shapely.geometry import Point
+            mask = [city_polygon.contains(Point(lon, lat)) for lon, lat in zip(df["lon"], df["lat"])]
+            df = df[mask].reset_index(drop=True)
+        except Exception:
+            pass
+    if len(df) < 10:
+        return _empty("Insufficient POIs within city boundary")
+    center_lat = float(df["lat"].mean())
+    center_lon = float(df["lon"].mean())
+    try:
+        from scipy.stats import gaussian_kde
+        coords = np.vstack([df["lon"].values, df["lat"].values])
+        kde = gaussian_kde(coords, bw_method=0.05)
+        lon_range = np.linspace(df["lon"].min(), df["lon"].max(), 80)
+        lat_range = np.linspace(df["lat"].min(), df["lat"].max(), 80)
+        lon_grid, lat_grid = np.meshgrid(lon_range, lat_range)
+        z = kde(np.vstack([lon_grid.ravel(), lat_grid.ravel()])).reshape(lon_grid.shape)
+        fig = go.Figure(go.Densitymap(
+            lat=lat_grid.ravel(), lon=lon_grid.ravel(), z=z.ravel(),
+            radius=15, colorscale="YlOrRd", showscale=True,
+            colorbar=dict(title="POI Density"),
+            opacity=0.65,
+        ))
+    except Exception:
+        fig = go.Figure(go.Densitymap(
+            lat=df["lat"], lon=df["lon"], z=[1] * len(df),
+            radius=20, colorscale="YlOrRd", showscale=False, opacity=0.65,
+        ))
+    zoom_val = compute_zoom_level(gpd.GeoDataFrame(
+        geometry=gpd.points_from_xy(df["lon"], df["lat"]), crs="EPSG:4326"))
+    fig.update_layout(
+        title="POI Density Distribution",
+        map=dict(style="carto-positron", center=dict(lat=center_lat, lon=center_lon), zoom=zoom_val),
+        template="plotly_white", height=500, margin=dict(l=0, r=0, t=50, b=0),
+        font=_FONT, title_font=_TITLE_FONT,
     )
     return fig
+
+
+def chart_morphological_transition(merged_hex_gdf, city_center_lat: float,
+                                    city_center_lon: float) -> go.Figure:
+    if merged_hex_gdf is None or merged_hex_gdf.empty:
+        return _empty("No hex data for morphological transition")
+    if "lat" not in merged_hex_gdf.columns or "lon" not in merged_hex_gdf.columns:
+        return _empty("Need lat/lon columns in hex grid")
+    metrics_available = [c for c in ["FAR", "CMI", "transport_index", "green_space_ratio",
+                                      "diversity_score"] if c in merged_hex_gdf.columns]
+    if not metrics_available:
+        return _empty("No morphological metrics available for transition chart")
+    df = merged_hex_gdf.copy()
+    try:
+        center_gdf = gpd.GeoDataFrame(
+            geometry=gpd.points_from_xy([city_center_lon], [city_center_lat]), crs="EPSG:4326"
+        ).to_crs("EPSG:3857")
+        pts_gdf = gpd.GeoDataFrame(
+            geometry=gpd.points_from_xy(df["lon"], df["lat"]), crs="EPSG:4326"
+        ).to_crs("EPSG:3857")
+        df["dist_km"] = pts_gdf.geometry.distance(center_gdf.geometry[0]) / 1000
+    except Exception:
+        return _empty("Distance computation failed for morphological transition")
+    df = df.dropna(subset=["dist_km"])
+    df["dist_band"] = (df["dist_km"] // 0.5 * 0.5).round(1)
+    _colors = {"FAR": "#E74C3C", "CMI": "#D4691E", "transport_index": "#3498DB",
+               "green_space_ratio": "#27AE60", "diversity_score": "#9B59B6"}
+    fig = go.Figure()
+    for col in metrics_available:
+        band_mean = df.groupby("dist_band")[col].mean().reset_index()
+        band_mean = band_mean.sort_values("dist_band")
+        s = band_mean[col]
+        mn, mx = s.min(), s.max()
+        normed = (s - mn) / (mx - mn) if mx != mn else pd.Series(0.5, index=s.index)
+        fig.add_trace(go.Scatter(
+            x=band_mean["dist_band"], y=normed,
+            mode="lines+markers", name=col.replace("_", " ").title(),
+            line=dict(color=_colors.get(col, "#888888"), width=2),
+            marker=dict(size=4),
+        ))
+    fig.update_layout(
+        title="Morphological Transition from City Center",
+        xaxis_title="Distance from Center (km)", yaxis_title="Normalised Metric Value",
+        template="plotly_white", height=420,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        font=_FONT, title_font=_TITLE_FONT,
+    )
+    return fig
+
+
+def chart_urban_efficiency_pareto(stress_gdf, admin_boundaries=None) -> go.Figure:
+    if stress_gdf is None or stress_gdf.empty or "urban_stress" not in stress_gdf.columns:
+        return _empty("No stress data for efficiency Pareto")
+    comp_cols = {
+        "density_stress": "Density",
+        "green_deficit": "Green Deficit",
+        "transit_deficit": "Transit Deficit",
+        "flood_stress": "Flood",
+        "mono_stress": "Mono-Function",
+    }
+    available = {k: v for k, v in comp_cols.items() if k in stress_gdf.columns}
+    if not available:
+        return _empty("No stress component columns for Pareto chart")
+    means = {v: float(stress_gdf[k].mean()) for k, v in available.items()}
+    labels = sorted(means, key=means.get, reverse=True)
+    values = [means[l] for l in labels]
+    cumulative = np.cumsum(values) / sum(values) * 100
+    _bar_colors = ["#E74C3C" if v > 0.6 else "#F39C12" if v > 0.3 else "#27AE60" for v in values]
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    fig.add_trace(go.Bar(
+        x=labels, y=values, marker_color=_bar_colors,
+        name="Mean Stress Component",
+    ), secondary_y=False)
+    fig.add_trace(go.Scatter(
+        x=labels, y=cumulative, mode="lines+markers",
+        line=dict(color="#2C3E50", width=2), marker=dict(size=7),
+        name="Cumulative %",
+    ), secondary_y=True)
+    fig.add_hline(y=80, line_dash="dot", line_color="gray", opacity=0.6, secondary_y=True,
+                  annotation_text="80% threshold")
+    fig.update_layout(
+        title="Urban Stress Pareto Analysis",
+        template="plotly_white", height=420,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        font=_FONT, title_font=_TITLE_FONT,
+    )
+    fig.update_yaxes(title_text="Mean Component Score", secondary_y=False)
+    fig.update_yaxes(title_text="Cumulative %", secondary_y=True, range=[0, 110])
+    return fig
+
+
+def chart_accessibility_spider(poi_df, city_center_lat: float,
+                                city_center_lon: float) -> go.Figure:
+    if poi_df is None or poi_df.empty:
+        return _empty("No POI data for accessibility spider")
+    if "lat" not in poi_df.columns or "lon" not in poi_df.columns:
+        return _empty("POI data missing lat/lon columns")
+    _services = {
+        "Food & Drink":   ["food_and_beverage", "restaurant", "cafe", "bakery", "bar"],
+        "Healthcare":     ["health_and_medical", "hospital", "pharmacy", "clinic"],
+        "Education":      ["education", "school", "university", "kindergarten"],
+        "Retail":         ["retail", "shop", "market", "supermarket"],
+        "Recreation":     ["entertainment", "leisure", "sport", "gym", "park"],
+        "Finance":        ["financial_service", "bank", "atm"],
+    }
+    try:
+        center_gdf = gpd.GeoDataFrame(
+            geometry=gpd.points_from_xy([city_center_lon], [city_center_lat]), crs="EPSG:4326"
+        ).to_crs("EPSG:3857")
+        center_pt = center_gdf.geometry[0]
+        poi_gdf = gpd.GeoDataFrame(
+            geometry=gpd.points_from_xy(poi_df["lon"], poi_df["lat"]), crs="EPSG:4326"
+        ).to_crs("EPSG:3857")
+    except Exception:
+        return _empty("Coordinate projection failed for accessibility spider")
+    scores = {}
+    for label, kws in _services.items():
+        if "category" in poi_df.columns:
+            mask = poi_df["category"].fillna("").str.lower().apply(lambda c: any(k in c for k in kws))
+        else:
+            mask = pd.Series(False, index=poi_df.index)
+        sub_idx = poi_df[mask].index
+        if len(sub_idx) == 0:
+            scores[label] = 0.0
+            continue
+        dists = poi_gdf.geometry.iloc[sub_idx].distance(center_pt)
+        med_dist = float(dists.median())
+        scores[label] = max(0.0, 1.0 - med_dist / 5000)
+    labels = list(scores.keys())
+    values = [scores[l] for l in labels]
+    fig = go.Figure(go.Scatterpolar(
+        r=values + [values[0]], theta=labels + [labels[0]],
+        fill="toself", fillcolor="rgba(52,152,219,0.25)",
+        line=dict(color="#2980B9", width=2),
+    ))
+    fig.update_layout(
+        title="Service Accessibility from City Center",
+        polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
+        template="plotly_white", height=420, showlegend=False,
+        font=_FONT, title_font=_TITLE_FONT,
+    )
+    return fig
+
+
+_CAT_GROUPS = {
+    "Food & Hospitality": [
+        "restaurant", "cafe", "bar", "bakery", "food", "drink",
+        "french_restaurant", "pizza", "burger", "coffee", "tea",
+        "pub", "brewery", "bistro", "brasserie", "caterer",
+        "fast_food", "hotel", "hostel", "motel", "accommodation",
+        "lodging", "inn", "resort", "catering",
+    ],
+    "Retail & Commerce": [
+        "clothing_store", "shopping", "retail", "store", "shop",
+        "supermarket", "grocery", "market", "mall", "boutique",
+        "flowers_and_gifts", "bookstore", "electronics", "furniture",
+        "hardware", "jewelry", "toy", "sporting_goods", "pet_store",
+        "real_estate", "real_estate_agent", "professional_services",
+        "office", "business", "lawyer", "accountant", "consultant",
+        "insurance", "bank", "banks", "financial", "notary",
+        "advertising", "marketing", "travel_agency", "automotive",
+        "auto", "car", "gas_station",
+    ],
+    "Health & Education": [
+        "hospital", "clinic", "doctor", "dentist", "pharmacy",
+        "health", "medical", "optician", "veterinary", "spa",
+        "wellness", "naturopathic", "holistic", "physiotherapy",
+        "psychologist", "therapist", "naturopathic_holistic",
+        "beauty_salon", "hair_salon", "nail_salon", "massage",
+        "barber", "school", "university", "college", "kindergarten",
+        "education", "college_university", "private_school",
+        "tutoring", "library", "language_school", "driving_school",
+    ],
+    "Culture & Leisure": [
+        "museum", "theater", "cinema", "gallery", "arts",
+        "entertainment", "sports", "gym", "fitness", "park",
+        "recreation", "club", "sports_club_and_league", "stadium",
+        "bowling", "casino", "arcade", "concert", "nightclub",
+        "dance", "yoga", "pilates", "swimming", "tennis", "golf",
+    ],
+    "Community & Services": [
+        "community_services", "non_profit", "government", "post_office",
+        "police", "fire_station", "church", "mosque", "temple",
+        "synagogue", "religious", "social_service", "charity",
+        "community_services_non_profits", "social_service_organizations",
+        "transportation", "train_station", "bus_station", "parking",
+    ],
+}
+
+_FUNC_COLORS = {
+    "Food & Hospitality":   "#E74C3C",
+    "Retail & Commerce":    "#F39C12",
+    "Health & Education":   "#27AE60",
+    "Culture & Leisure":    "#9B59B6",
+    "Community & Services": "#3498DB",
+    "Mixed":                "#95A5A6",
+    "Other":                "#ECF0F1",
+}
+
+_VALID_FUNC_GROUPS = set(_CAT_GROUPS.keys()) | {"Mixed", "Other"}
+
+
+def _categorize_poi(raw: str) -> str:
+    cat_lower = str(raw).lower().strip()
+    for group, keywords in _CAT_GROUPS.items():
+        for kw in keywords:
+            if kw in cat_lower or cat_lower in kw:
+                return group
+    return "Other"
+
+
+def _get_dominant_or_mixed(group_series) -> str:
+    counts = group_series.value_counts()
+    if len(counts) == 0:
+        return "Other"
+    top_group = counts.index[0]
+    top_count = counts.iloc[0]
+    if top_group == "Other" and len(counts) > 1:
+        top_group = counts.index[1]
+        top_count = counts.iloc[1]
+    total = counts.sum()
+    if total > 0 and top_count / total < 0.40:
+        return "Mixed"
+    return top_group
+
+
+def chart_poi_dominance_map(poi_df, merged_hex_gdf=None) -> go.Figure:
+    if poi_df is None or poi_df.empty:
+        return _empty("No POI data for dominance map")
+    if "lat" not in poi_df.columns or "lon" not in poi_df.columns:
+        return _empty("POI data missing lat/lon columns")
+    if "category" not in poi_df.columns:
+        return _empty("POI data missing category column")
+    resolution = 8
+    df = poi_df.dropna(subset=["lat", "lon", "category"]).copy()
+    df["h3_cell"] = df.apply(
+        lambda r: h3.latlng_to_cell(float(r["lat"]), float(r["lon"]), resolution), axis=1
+    )
+    df["functional_group"] = df["category"].apply(_categorize_poi)
+    dominant = (
+        df.groupby("h3_cell")["functional_group"]
+        .apply(_get_dominant_or_mixed)
+        .reset_index()
+    )
+    dominant.columns = ["h3_cell", "dominant_function"]
+    dominant["dominant_function"] = dominant["dominant_function"].apply(
+        lambda x: x if x in _VALID_FUNC_GROUPS else "Other"
+    )
+    group_counts = dominant["dominant_function"].value_counts()
+    print(f"[poi_dominance] group distribution: {group_counts.to_dict()}")
+    return _choropleth_hex(
+        dominant, "dominant_function", "POI Functional Zone Dominance",
+        color_discrete_map=_FUNC_COLORS, hover_cols=["dominant_function"], height=520,
+    )
+
+
+def chart_street_centrality_edges(graph, city_center_lat: float,
+                                   city_center_lon: float) -> go.Figure:
+    if graph is None:
+        return _empty("No street graph for centrality edges")
+    try:
+        import networkx as nx
+        nodes = list(graph.nodes)
+        if len(nodes) < 100:
+            return _empty("Insufficient street network nodes for centrality analysis")
+        bc = nx.betweenness_centrality(graph, k=min(200, len(nodes)), normalized=True,
+                                        weight="length", seed=42)
+        edges = list(graph.edges(data=True))
+        if len(edges) > 3000:
+            edges = edges[:3000]
+        center_lat, center_lon = city_center_lat, city_center_lon
+        lats, lons, vals = [], [], []
+        for u, v, data in edges:
+            u_data = graph.nodes[u]
+            v_data = graph.nodes[v]
+            u_bc = bc.get(u, 0)
+            v_bc = bc.get(v, 0)
+            edge_bc = (u_bc + v_bc) / 2
+            lats += [u_data.get("y", 0), v_data.get("y", 0), None]
+            lons += [u_data.get("x", 0), v_data.get("x", 0), None]
+            vals.append(edge_bc)
+        if not lats:
+            return _empty("No edge coordinates found")
+        val_arr = np.array(vals)
+        mn, mx = val_arr.min(), val_arr.max()
+        normed = (val_arr - mn) / (mx - mn) if mx != mn else val_arr
+        colors = [f"rgba({int(255*(1-v))},{int(50+100*v)},{int(50+200*v)},0.8)"
+                  for v in normed]
+        edge_colors = []
+        for i, clr in enumerate(colors):
+            edge_colors += [clr, clr, "rgba(0,0,0,0)"]
+        fig = go.Figure(go.Scattermap(
+            lat=lats, lon=lons, mode="lines",
+            line=dict(width=1.5, color=edge_colors[0] if edge_colors else "#888888"),
+            hoverinfo="skip",
+        ))
+        fig.update_layout(
+            title="Street Network Betweenness Centrality",
+            map=dict(style="carto-darkmatter",
+                     center=dict(lat=center_lat, lon=center_lon), zoom=12),
+            template="plotly_white", height=520, margin=dict(l=0, r=0, t=50, b=0),
+            font=_FONT, title_font=_TITLE_FONT,
+        )
+        return fig
+    except Exception as exc:
+        return _empty(f"Street centrality failed: {exc}")
+

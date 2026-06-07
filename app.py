@@ -40,8 +40,6 @@ from charts import (
     chart_far_heatmap,
     chart_landuse_composition,
     chart_street_orientation,
-    chart_building_typology,
-    chart_cmi_distribution,
     chart_transport_accessibility,
     chart_road_hierarchy,
     chart_transit_heatmap,
@@ -63,7 +61,6 @@ from charts import (
     chart_vulnerability_map,
     chart_vulnerability_vs_stress,
     chart_segregation_map,
-    chart_segregation_profile,
     chart_morphotype_radar_comparison,
     chart_terrain_elevation,
     chart_terrain_flood_risk,
@@ -72,9 +69,13 @@ from charts import (
     chart_slope_elevation_2d,
     add_admin_boundaries_to_fig,
     chart_heat_island_map,
-    chart_climate_summary,
     chart_district_scorecard,
-    chart_population_density,
+    chart_poi_density_contour,
+    chart_morphological_transition,
+    chart_urban_efficiency_pareto,
+    chart_accessibility_spider,
+    chart_poi_dominance_map,
+    chart_street_centrality_edges,
 )
 
 load_dotenv()
@@ -162,6 +163,23 @@ def _has_cols(gdf, *cols, min_rows: int = 10) -> bool:
     if gdf is None or gdf.empty or len(gdf) < min_rows:
         return False
     return all(c in gdf.columns for c in cols)
+
+
+def has_data(df_or_gdf, min_rows=3, required_cols=None):
+    """Check if dataframe has enough data to plot."""
+    if df_or_gdf is None:
+        return False
+    if hasattr(df_or_gdf, 'empty') and df_or_gdf.empty:
+        return False
+    if len(df_or_gdf) < min_rows:
+        return False
+    if required_cols:
+        for col in required_cols:
+            if col not in df_or_gdf.columns:
+                return False
+            if df_or_gdf[col].isna().all():
+                return False
+    return True
 
 
 def safe_merge(base, other, on: str = "h3_cell", how: str = "left"):
@@ -515,7 +533,7 @@ if analyze:
 
     if hex_metrics.empty and run_morphology:
         st.warning("Building data unavailable — using POI hex grid as base layer")
-        poi_hex = create_hex_grid_from_pois(poi_df, resolution=9)
+        poi_hex = create_hex_grid_from_pois(poi_df)
         if poi_hex.empty and analysis_bbox:
             poi_hex = create_hex_grid_from_bbox(analysis_bbox, resolution=9)
         hex_metrics = poi_hex
@@ -631,6 +649,8 @@ if analyze:
         city_center_lon = float(poi_df["lon"].mean())
     else:
         city_center_lat, city_center_lon = 0.0, 0.0
+    st.session_state["city_center_lat"] = city_center_lat
+    st.session_state["city_center_lon"] = city_center_lon
 
     roads_gdf = transport_data.get("roads", gpd.GeoDataFrame())
     road_type_counts = {}
@@ -727,21 +747,42 @@ if analyze:
         c3.metric("Green Space", f"{green_pct:.1f}%")
         c4.metric("Dominant Morphotype", dominant_morphotype)
 
-        _safe_chart(chart_poi_distribution, category_series,
-                    key="t1_poi", ss_key="poi_distribution")
-        _safe_chart(chart_landuse_composition, lu_metrics,
-                    key="t1_landuse", ss_key="landuse_composition")
-
-        if not analysis_hex.empty and 'pop_density_proxy' in analysis_hex.columns:
-            st.subheader("Population Density Proxy")
-            _safe_chart(chart_population_density, analysis_hex,
-                        key="t1_pop_density", ss_key="pop_density",
+        if has_data(poi_df, min_rows=1):
+            _safe_chart(chart_poi_dominance_map, poi_df, analysis_hex if not analysis_hex.empty else None,
+                        key="t1_poi_dominance", ss_key="poi_dominance_map",
                         apply_admin_bounds=True)
+            st.caption("Dominant POI functional zone per H3 hex cell (resolution 8, ~460m width). Each cell is coloured by its primary function — the category group with the highest POI count. Cells where no single group exceeds 40% of POIs are labelled 'Mixed', indicating genuinely multi-functional urban fabric. Source: Overture Maps Places. Groups: Food & Hospitality (restaurants, cafes, hotels), Retail & Commerce (shops, offices, banks, real estate), Health & Education (clinics, schools, salons), Culture & Leisure (museums, gyms, parks), Community & Services (government, religious, transport).")
+
+        col_t1l, col_t1r = st.columns(2)
+        with col_t1l:
+            if has_data(category_series, min_rows=1):
+                _safe_chart(chart_poi_distribution, category_series,
+                            key="t1_poi", ss_key="poi_distribution")
+                st.caption("Distribution of Points of Interest by functional category. Source: Overture Maps Places dataset (global POI database aggregating Meta, Microsoft, TomTom and OSM contributions). Each bar represents the count of POIs in that category within the city boundary. Look for dominant functions to understand the city's economic and service profile.")
+        with col_t1r:
+            if lu_metrics:
+                _safe_chart(chart_landuse_composition, lu_metrics,
+                            key="t1_landuse", ss_key="landuse_composition")
+                st.caption("Donut chart of land use area composition across the city. Source: OSM landuse, leisure, and natural tags (polygonal features only). Percentages represent the share of mapped polygonal area — unmapped or unclassified areas are excluded. The green space indicator compares the city's green coverage against the EU urban average of 15%.")
+
+        if has_data(poi_df, min_rows=10):
+            _safe_chart(chart_poi_density_contour, poi_df,
+                        st.session_state.get("city_polygon"),
+                        key="t1_poi_contour", ss_key="poi_density_contour",
+                        apply_admin_bounds=True)
+            st.caption("Kernel density estimation of POI concentration across the city, rendered as a continuous heat surface on the map. Source: Overture Maps Places. Uses Gaussian KDE with bandwidth 0.08° to smooth point data into a density field — warmer colours indicate higher concentrations of urban activity, revealing commercial cores and service clusters.")
+
+        if has_data(poi_df, min_rows=5) and city_center_lat != 0.0:
+            _safe_chart(chart_accessibility_spider, poi_df, city_center_lat, city_center_lon,
+                        key="t1_accessibility_spider", ss_key="accessibility_spider")
+            st.caption("Radar chart showing the distance from the city centre to the nearest facility of each service type, normalised so that closer = higher score. Source: Overture Maps Places for commercial and civic services; OSM transit for public transport. Each axis label corresponds to the nearest POI in that category — raw distances in km shown on hover. Use to assess what is missing or distant from the urban core.")
 
         _tab_export([
-            ("poi_distribution",    "POI Distribution"),
-            ("landuse_composition", "Land Use Composition"),
-            ("pop_density",         "Population Density"),
+            ("poi_dominance_map",    "POI Dominance Map"),
+            ("poi_distribution",     "POI Distribution"),
+            ("landuse_composition",  "Land Use Composition"),
+            ("poi_density_contour",  "POI Density Contour"),
+            ("accessibility_spider", "Accessibility Spider"),
         ], "tab1")
 
     # ── Tab 2: Morphology ─────────────────────────────────────────────────────
@@ -749,34 +790,38 @@ if analyze:
         if not run_morphology:
             st.info("Module disabled — enable in sidebar")
         else:
-            _safe_chart(chart_far_heatmap, hex_metrics,
-                        key="t2_far", ss_key="far_heatmap", apply_admin_bounds=True)
+            if has_data(hex_metrics, min_rows=1, required_cols=['FAR']):
+                _safe_chart(chart_far_heatmap, hex_metrics,
+                            key="t2_far", ss_key="far_heatmap", apply_admin_bounds=True)
+                st.caption("Floor Area Ratio (FAR) per H3 hex cell: total built floor area divided by hex cell area. Source: OSM buildings (footprint area × estimated floors, where floors = height / 3.5m). FAR is a standard urban density metric — values above 2.0 indicate dense urban fabric; below 0.3 indicates suburban or low-rise areas.")
 
-            col_l, col_r = st.columns(2)
-            with col_l:
-                _safe_chart(chart_building_typology, typology_counts,
-                            key="t2_typology", ss_key="building_typology")
-            with col_r:
-                _safe_chart(chart_cmi_distribution, hex_metrics,
-                            key="t2_cmi", ss_key="cmi_distribution")
+            if has_data(hex_metrics, min_rows=1, required_cols=['cluster']):
+                _safe_chart(chart_morphotype_clusters, hex_metrics,
+                            key="t2_clusters", ss_key="morphotype_clusters", apply_admin_bounds=True)
+                st.caption("Urban morphotype classification derived from KMeans clustering (k=5) applied to FAR, building coverage ratio, median height, and street density per H3 cell. Source: OSM buildings and OSMnx street network. Clusters are labelled by their dominant characteristics: historic_core (compact, mixed height), dense_urban (high FAR), mixed_mid (medium density), suburban (low FAR, large plots), industrial (large footprints, low height).")
 
-            _safe_chart(chart_morphotype_clusters, hex_metrics,
-                        key="t2_clusters", ss_key="morphotype_clusters", apply_admin_bounds=True)
-            _safe_chart(chart_density_gradient, buildings_gdf, city_center_lat, city_center_lon,
-                        key="t2_density_grad", ss_key="density_gradient")
+            if has_data(buildings_gdf, min_rows=5, required_cols=['height']):
+                _safe_chart(chart_density_gradient, buildings_gdf, city_center_lat, city_center_lon,
+                            poi_df=poi_df,
+                            key="t2_density_grad", ss_key="density_gradient")
+                st.caption("Mean building height (left axis, blue) and POI density (right axis, orange) as a function of distance from the city centre, in 200m bands. Source: OSM buildings (height tag) and Overture Maps POI. The smoothed line uses a 3-band rolling average. A classic monocentric city shows declining height from centre; polycentric cities show multiple peaks. The POI gradient reveals where urban activity extends beyond the residential core.")
+
+            if has_data(analysis_hex, min_rows=5) and city_center_lat != 0.0:
+                _safe_chart(chart_morphological_transition, analysis_hex,
+                            city_center_lat, city_center_lon,
+                            key="t2_morph_transition", ss_key="morphological_transition")
+                st.caption("Multi-line chart showing how four key urban metrics change with distance from the city centre in 500m bands: building density (FAR), green space ratio, transport accessibility, and POI diversity. All metrics normalised to 0–1 for comparability. Source: OSM buildings, OSM green space, OSM transit, and Overture Maps POI, aggregated to H3 hex cells and grouped by distance band. Vertical dotted lines mark 1km and 3km thresholds.")
 
             if _has_cols(analysis_hex, "transport_index", "nature_index"):
                 _safe_chart(chart_urban_quality_index, analysis_hex,
                             key="t2_quality", ss_key="urban_quality")
-            else:
-                st.info("Urban quality index needs transport + nature data.")
+                st.caption("Scatter plot of Transport Accessibility Index (x) versus Nature Index (y) for each H3 hex cell, sized by FAR and coloured by Composite Morphological Index. The dashed regression line and correlation coefficient (r) show how strongly transport and nature co-vary across the city. Source: OSM and Overture data. Quadrant labels classify cells by their combined performance profile.")
 
         _tab_export([
-            ("far_heatmap",         "FAR Heatmap"),
-            ("morphotype_clusters", "Morphotype Clusters"),
-            ("building_typology",   "Building Typology"),
-            ("cmi_distribution",    "CMI Distribution"),
-            ("density_gradient",    "Density Gradient"),
+            ("far_heatmap",              "FAR Heatmap"),
+            ("morphotype_clusters",      "Morphotype Clusters"),
+            ("density_gradient",         "Density Gradient"),
+            ("morphological_transition", "Morphological Transition"),
         ], "tab2")
 
     # ── Tab 3: Street Network ─────────────────────────────────────────────────
@@ -789,14 +834,26 @@ if analyze:
             c2.metric("Dead-End Ratio", f"{dead_end_ratio:.1%}")
             c3.metric("Block Size Median", f"{block_size_median:,.0f} m²")
 
-            _safe_chart(chart_street_orientation, orientation_entropy, orientation_hist,
-                        key="t3_orientation", ss_key="street_orientation")
-            _safe_chart(chart_street_network_radar, net_stats, city_name,
-                        key="t3_radar", ss_key="street_radar")
+            if orientation_hist and any(h > 0 for h in orientation_hist):
+                _safe_chart(chart_street_orientation, orientation_entropy, orientation_hist,
+                            key="t3_orientation", ss_key="street_orientation")
+                st.caption("Polar bar chart (wind rose) showing the distribution of street orientations in 36 bins of 5° each, mirrored for bidirectionality. Source: OSM street network via OSMnx, using bearing of each street segment. A uniform distribution indicates an isotropic organic network; strong peaks at 0°/90° indicate a cardinal grid. Shannon entropy value shown in title — lower entropy = more structured grid pattern.")
+            if net_stats:
+                _safe_chart(chart_street_network_radar, net_stats, city_name,
+                            key="t3_radar", ss_key="street_radar")
+                st.caption("Radar chart of seven street network metrics normalised to 0–1: connectivity (mean node degree), block size score (inverse of mean street length), intersection density, network efficiency (inverse circuity), dead-end ratio, orientation entropy (street direction diversity), and share of major roads. Source: OSM street network via OSMnx. A regular grid city scores high on connectivity and low on orientation entropy; an organic medieval network scores the opposite.")
+
+            if graph is not None and city_center_lat != 0.0:
+                _safe_chart(chart_street_centrality_edges, graph,
+                            city_center_lat, city_center_lon,
+                            key="t3_centrality", ss_key="street_centrality",
+                            apply_admin_bounds=True)
+                st.caption("Street network betweenness centrality mapped onto individual street segments, coloured from blue (low) to red (critical). Betweenness centrality measures how often each street lies on the shortest path between all pairs of nodes — high-centrality streets are structural movement corridors. Source: OSM street network via OSMnx and NetworkX. Computed using k=500 random sample pairs for performance. Dark background for visual contrast with the centrality gradient.")
 
         _tab_export([
             ("street_orientation", "Street Orientation"),
             ("street_radar",       "Street Network Radar"),
+            ("street_centrality",  "Street Centrality"),
         ], "tab3")
 
     # ── Tab 4: Transport ──────────────────────────────────────────────────────
@@ -811,14 +868,19 @@ if analyze:
 
             col_l, col_r = st.columns(2)
             with col_l:
-                _safe_chart(chart_road_hierarchy, road_type_counts,
-                            key="t4_road_hier", ss_key="road_hierarchy")
+                if road_type_counts:
+                    _safe_chart(chart_road_hierarchy, road_type_counts,
+                                key="t4_road_hier", ss_key="road_hierarchy")
             with col_r:
-                _safe_chart(chart_transit_heatmap, transit_stops_gdf,
-                            key="t4_transit_heat", ss_key="transit_heatmap")
+                if has_data(transit_stops_gdf, min_rows=1):
+                    _safe_chart(chart_transit_heatmap, transit_stops_gdf,
+                                key="t4_transit_heat", ss_key="transit_heatmap",
+                                apply_admin_bounds=True)
 
-            _safe_chart(chart_transport_accessibility, transport_hex,
-                        key="t4_transport_acc", ss_key="transport_map", apply_admin_bounds=True)
+            if has_data(transport_hex, min_rows=1, required_cols=['transport_index']):
+                _safe_chart(chart_transport_accessibility, transport_hex,
+                            key="t4_transport_acc", ss_key="transport_map", apply_admin_bounds=True)
+                st.caption("Composite transport accessibility index per H3 cell, combining: transit stop density within 400m walk (50% weight), cycling infrastructure coverage in km/km² (30%), and road type entropy (20%). Source: OSM public_transport, highway, and cycleway tags via OSMnx. Higher values (green) indicate well-served areas; red cells lack both transit and cycling infrastructure.")
 
         _tab_export([
             ("road_hierarchy",  "Road Hierarchy"),
@@ -838,23 +900,30 @@ if analyze:
 
             col_l, col_r = st.columns(2)
             with col_l:
-                _safe_chart(chart_green_space_access, nature_hex,
-                            key="t5_green_access", ss_key="nature_map", apply_admin_bounds=True)
+                if has_data(nature_hex, min_rows=1, required_cols=['nature_index']):
+                    _safe_chart(chart_green_space_access, nature_hex,
+                                key="t5_green_access", ss_key="nature_map", apply_admin_bounds=True)
+                    st.caption("Green space coverage ratio per H3 hex cell: proportion of cell area occupied by parks, forests, gardens, and natural vegetation. Source: OSM leisure=park/garden, landuse=forest/meadow/grass, natural=wood/scrub tags. Cells are coloured from red (no green cover) to dark green (high coverage). Use alongside the flood risk layer to identify green buffers near waterways.")
             with col_r:
-                _safe_chart(chart_flood_risk_zones, nature_hex,
-                            key="t5_flood", ss_key="flood_risk_map", apply_admin_bounds=True)
+                if has_data(nature_hex, min_rows=1, required_cols=['flood_risk_tier']):
+                    _safe_chart(chart_flood_risk_zones, nature_hex,
+                                key="t5_flood", ss_key="flood_risk_map", apply_admin_bounds=True)
+                    st.caption("Flood risk classification based on proximity to waterways and terrain elevation. Source: OSM natural=water and waterway tags for water body locations; Open-Meteo Elevation API (SRTM 90m resolution) for terrain height. Risk tiers: high = within 50m of waterway or low elevation; medium = 50–200m; low = beyond 200m and elevated terrain. This is a proxy indicator — not an official flood hazard map.")
 
             col_l2, col_r2 = st.columns(2)
             with col_l2:
-                _safe_chart(chart_nature_radar, nature_metrics_dict,
-                            key="t5_nature_radar", ss_key="nature_radar")
+                if nature_metrics_dict:
+                    _safe_chart(chart_nature_radar, nature_metrics_dict,
+                                key="t5_nature_radar", ss_key="nature_radar")
             with col_r2:
-                _safe_chart(
-                    chart_15min_city_score,
-                    poi_df, transit_stops_gdf, green_spaces_gdf,
-                    city_center_lat, city_center_lon,
-                    key="t5_15min", ss_key="city_15min",
-                )
+                if has_data(poi_df, min_rows=1):
+                    _safe_chart(
+                        chart_15min_city_score,
+                        poi_df, transit_stops_gdf, green_spaces_gdf,
+                        city_center_lat, city_center_lon,
+                        key="t5_15min", ss_key="city_15min",
+                    )
+                    st.caption("15-minute city accessibility score by service type: percentage of city area where each service category is reachable within a 1.25km walk (15 minutes at 5km/h). Source: Overture Maps POI for food, healthcare, education; OSM transit stops for public transit; OSM leisure polygons for green space. Scored using a 10×10 sample grid and nearest-neighbour distance. Green ≥ 70%, orange 40–70%, red < 40%.")
 
         # Terrain (independent of run_nature)
         if run_terrain and _has_cols(analysis_hex, "elevation_m", "terrain_flood_risk", min_rows=3):
@@ -864,39 +933,35 @@ if analyze:
                 _safe_chart(chart_terrain_elevation, analysis_hex,
                             key="t5_terrain_elev", ss_key="terrain_elevation",
                             apply_admin_bounds=True)
+                st.caption("Terrain elevation in metres above sea level, sampled at H3 hex cell centroids from a regular grid. Source: Open-Meteo Elevation API using SRTM global digital elevation model at 90m resolution, queried via a 30×30 point grid over the city bounding box and interpolated to hex centroids via nearest-neighbour assignment.")
             with col_t2:
                 _safe_chart(chart_terrain_flood_risk, analysis_hex,
                             key="t5_terrain_flood", ss_key="terrain_flood_risk",
                             apply_admin_bounds=True)
+                st.caption("Terrain-based flood risk composite index per H3 cell, combining three components: elevation risk (40% weight, lower = higher risk), Topographic Wetness Index proxy (35%, computed as ln(cell_area / tan(slope))), and slope risk (25%, flatter terrain retains water). Source: Open-Meteo Elevation API / SRTM. Higher values indicate greater terrain-based flood susceptibility.")
 
             _safe_chart(chart_terrain_cross_buildings, analysis_hex,
                         key="t5_terrain_cross", ss_key="terrain_cross")
+            st.caption("Scatter plot comparing building density (FAR) against terrain elevation for each H3 hex cell, with cell size proportional to building coverage ratio (BCR). Source: OSM buildings for FAR/BCR; Open-Meteo Elevation API for terrain height. The vertical line marks 10m elevation (approximate low-lying threshold); the horizontal line shows the city median FAR. Top-left quadrant (dense + low elevation) indicates highest combined risk.")
 
             col_t3, col_t4 = st.columns(2)
             with col_t3:
                 _safe_chart(chart_twi_distribution, analysis_hex,
                             key="t5_twi", ss_key="twi_distribution")
+                st.caption("Distribution of Topographic Wetness Index (TWI) values across the city's H3 hex cells. TWI = ln(contributing_area / tan(slope)), a standard hydrological index indicating areas prone to water accumulation. Source: computed from SRTM elevation data via Open-Meteo API using numpy gradient. Thresholds: TWI < 8 = dry/elevated; 8–12 = moderate; > 12 = flood-prone hollows.")
             with col_t4:
                 _safe_chart(chart_slope_elevation_2d, analysis_hex,
                             key="t5_slope_elev", ss_key="slope_elevation")
-        elif run_terrain:
-            st.info("Terrain elevation data not available for this location.")
 
         # Urban Heat Island
         if run_climate:
             st.subheader("Urban Heat Island")
             if climate_data and 'error' not in climate_data and 'uhi_delta' in analysis_hex.columns:
-                col_u1, col_u2 = st.columns(2)
-                with col_u1:
-                    _safe_chart(chart_heat_island_map, analysis_hex,
-                                climate_data.get('temp_max_avg', 20),
-                                key="t5_uhi_map", ss_key="heat_island_map",
-                                apply_admin_bounds=True)
-                with col_u2:
-                    _safe_chart(chart_climate_summary, climate_data,
-                                key="t5_climate", ss_key="climate_summary")
-            else:
-                st.info("Climate data unavailable — check network connection or API status.")
+                _safe_chart(chart_heat_island_map, analysis_hex,
+                            climate_data.get('temp_max_avg', 20),
+                            key="t5_uhi_map", ss_key="heat_island_map",
+                            apply_admin_bounds=True)
+                st.caption("Urban Heat Island proxy per H3 hex cell, estimated as ΔTemperature from the city baseline. Formula: ΔT = BCR × 3.0 − green_ratio × 2.0, where BCR is building coverage ratio and green_ratio is green space fraction. Source: OSM buildings for BCR; OSM green space for green ratio; Open-Meteo 7-day forecast for baseline temperature. This is a structural proxy — not measured air temperature data.")
 
         _tab_export([
             ("nature_map",        "Green Space Access"),
@@ -905,7 +970,6 @@ if analyze:
             ("terrain_elevation", "Terrain Elevation"),
             ("terrain_flood_risk","Terrain Flood Risk"),
             ("heat_island_map",   "Heat Island Map"),
-            ("climate_summary",   "Climate Summary"),
         ], "tab5")
 
     # ── Tab 6: Cross-Analysis ─────────────────────────────────────────────────
@@ -919,24 +983,31 @@ if analyze:
             else:
                 _safe_chart(chart_opportunity_surface, analysis_hex,
                             key="t6_opp_surface", ss_key="opportunity_surface")
+                st.caption("3D scatter plot positioning each H3 hex cell in a three-dimensional space: transport accessibility (x), nature index (y), and inverse density (z, so low-density = high z). Colour indicates urban stress level. Source: OSM, Overture Maps, elevation data. The 'Optimal Zone' corner (high transport + high nature + low density) represents the most livable urban configuration — cells far from that corner are candidates for targeted investment.")
 
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     _safe_chart(chart_cross_heatmap_morph_transport, analysis_hex,
                                 key="t6_cross_mt", ss_key="cross_morph_transport")
+                    st.caption("Cross-tabulation matrix of Morphological Index quintiles (x) against Transport Accessibility quintiles (y), showing the count of H3 cells in each combination. Source: OSM buildings for morphology; OSM transit and cycling for transport. A concentration of cells in the top-right (dense + well-connected) indicates a compact transit-oriented city; concentration in bottom-left signals disconnected sprawl.")
                 with col2:
                     _safe_chart(chart_cross_heatmap_nature_morph, analysis_hex,
                                 key="t6_cross_nm", ss_key="cross_nature_density")
+                    st.caption("Cross-tabulation of Green Space Ratio quintiles (x) against Building Density / FAR quintiles (y), coloured by median Composite Morphological Index. Source: OSM landuse and leisure for green space; OSM buildings for FAR. Green cells in the top-left (high nature + high density) are rare urban jewels — areas that manage to combine density with greenery. Red cells in the bottom-right indicate dense, nature-deprived zones.")
                 with col3:
                     _safe_chart(chart_cross_heatmap_transport_nature, analysis_hex,
                                 key="t6_cross_tn", ss_key="cross_transport_nature")
+                    st.caption("Cross-tabulation of Transit Score quintiles (x) against Nature Index quintiles (y), showing concentration of H3 cells. Source: OSM transit stops for transit score; OSM green spaces and water proximity for nature index. The 'Transit-Rich Green Zones' annotation marks the ideal quadrant (top-right); 'Urban Stress Zones' marks areas with both poor transit and low nature access — typically peripheral mono-functional districts.")
 
-                _safe_chart(chart_landuse_crossref, crossref_df,
-                            key="t6_lu_crossref", ss_key="landuse_crossref")
+                if has_data(crossref_df, min_rows=1):
+                    _safe_chart(chart_landuse_crossref, crossref_df,
+                                key="t6_lu_crossref", ss_key="landuse_crossref")
+                    st.caption("Bubble chart comparing mean transport accessibility (x) and mean nature index (y) for each land use type, with bubble size proportional to total area in hectares. Source: OSM landuse polygons spatially joined to the H3 transport and nature hex grids. Reveals which land use types are systematically under-served by transport or lacking green access — useful for targeting policy interventions.")
 
                 if _has_cols(analysis_hex, "transport_index", "nature_index", min_rows=10):
                     _safe_chart(chart_urban_quality_index, analysis_hex,
                                 key="t6_quality", ss_key="urban_quality_cross")
+                    st.caption("Scatter plot of Transport Accessibility Index (x) versus Nature Index (y) for each H3 hex cell, sized by FAR and coloured by Composite Morphological Index. The dashed regression line and correlation coefficient (r) show how strongly transport and nature co-vary across the city. Source: OSM and Overture data. Quadrant labels classify cells by their combined performance profile.")
 
         _tab_export([
             ("opportunity_surface",    "Opportunity Surface"),
@@ -956,28 +1027,34 @@ if analyze:
             else:
                 _safe_chart(chart_urban_stress_map, analysis_hex,
                             key="t7_stress_map", ss_key="stress_map", apply_admin_bounds=True)
+                st.caption("Urban Stress Index per H3 cell — a composite of five equally-weighted components: building density stress (FAR-based), green space deficit (inverse nature index), transit deficit (inverse transport index), flood stress (terrain-based), and mono-functional stress (inverse POI diversity). Sources: OSM buildings, Overture POI, OSM transit, Open-Meteo elevation. Hover to see which driver dominates in each cell.")
 
                 col_l, col_r = st.columns(2)
                 with col_l:
                     _safe_chart(chart_urban_stress_decomposition, analysis_hex,
                                 key="t7_stress_decomp", ss_key="stress_decomp")
+                    st.caption("Decomposition of Urban Stress Index by stress class (low / moderate / high / critical), showing mean contribution of each of five components per class. Source: derived from OSM and Overture Maps data. Use this to understand what drives stress in different parts of the city — whether transit, density, green deficit, or flood risk is the primary factor.")
                 with col_r:
                     if _has_cols(analysis_hex, "vulnerability_score", min_rows=5):
                         _safe_chart(chart_vulnerability_map, analysis_hex,
                                     key="t7_vuln_map", ss_key="vulnerability_map",
                                     apply_admin_bounds=True)
-                    else:
-                        st.info("Vulnerability map needs nature/flood data.")
+                        st.caption("Temporal Vulnerability Index per H3 cell: composite of flood risk (35%), building density (30%), transport isolation (20%), and proximity to water (15%). Source: OSM waterways, OSM buildings, transport accessibility index, Open-Meteo elevation. Darker red cells are both physically exposed to flood risk and poorly connected — indicating limited evacuation or emergency response capacity.")
+
+                if _has_cols(analysis_hex, "urban_stress", min_rows=5):
+                    _safe_chart(chart_urban_efficiency_pareto, analysis_hex,
+                                key="t7_pareto", ss_key="stress_pareto")
+                    st.caption("Pareto analysis of urban stress distribution: hex cells sorted from highest to lowest stress (left to right), with the red line showing cumulative stress accumulation. Source: Urban Stress Index computed from OSM and Overture data. The annotation shows what percentage of the city's area concentrates 80% of total urban stress — a standard spatial inequality metric used in urban policy analysis.")
 
                 if _has_cols(analysis_hex, "urban_stress", "vulnerability_score", min_rows=5):
                     _safe_chart(chart_vulnerability_vs_stress, analysis_hex,
                                 key="t7_vuln_vs_stress", ss_key="vuln_vs_stress")
-                else:
-                    st.info("Vulnerability vs Stress scatter needs both computed layers.")
+                    st.caption("Scatter plot comparing Urban Stress Index (x-axis) against Temporal Vulnerability Index (y-axis) for each H3 cell, sized by FAR and coloured by vulnerability class. Source: both indices derived from OSM, Overture Maps, and SRTM elevation. Quadrant lines at 0.5/0.5 divide the city into four risk profiles — 'Double Risk Zone' (top-right) requires priority planning attention.")
 
         _tab_export([
             ("stress_map",       "Stress Map"),
             ("stress_decomp",    "Stress Decomposition"),
+            ("stress_pareto",    "Stress Pareto"),
             ("vulnerability_map","Vulnerability Map"),
             ("vuln_vs_stress",   "Vulnerability vs Stress"),
         ], "tab7")
@@ -994,38 +1071,29 @@ if analyze:
                 with col_l:
                     _safe_chart(chart_fabric_typology_matrix, analysis_hex,
                                 key="t8_fabric_matrix", ss_key="fabric_matrix")
+                    st.caption("16-cell Urban Fabric Typology Matrix classifying H3 hex cells by two dimensions: compactness (FAR, x-axis: sprawl → compact) and land use mix (POI Shannon entropy, y-axis: mono → vibrant). Source: OSM buildings for FAR; Overture Maps POI for diversity. Cell counts show how many hex cells fall in each fabric type — the dominant type reveals the city's overall urban character.")
                 with col_r:
                     _safe_chart(chart_fabric_typology_map, analysis_hex,
                                 key="t8_fabric_map", ss_key="fabric_map",
                                 apply_admin_bounds=True)
+                    st.caption("Spatial distribution of 16 urban fabric types across the city, based on the compactness × mix classification. Source: OSM buildings and Overture Maps POI, aggregated to H3 resolution 9. Each colour represents a distinct fabric archetype from 'Historic Mixed Core' (compact + vibrant) to 'Fringe / Industrial' (sprawl + mono). Use to identify which areas share similar planning challenges or opportunities.")
 
                 if _has_cols(analysis_hex, "cluster", min_rows=5):
                     _safe_chart(chart_morphotype_radar_comparison, analysis_hex,
                                 key="t8_radar_comp", ss_key="morphotype_radar")
-                else:
-                    st.info("Morphotype radar needs cluster labels from morphological analysis.")
+                    st.caption("Radar (spider) chart comparing 5 urban morphotype clusters across 8 analytical dimensions: FAR, transport index, nature index, POI diversity, street connectivity, green ratio, flood safety, and normalised building height. Source: all OSM, Overture, and elevation sources combined. Each polygon represents the average profile of one morphotype cluster — the shape reveals what makes each zone type analytically distinct.")
 
-                col_l2, col_r2 = st.columns(2)
-                with col_l2:
-                    if _has_cols(analysis_hex, "segregation_score", min_rows=5):
-                        _safe_chart(chart_segregation_map, analysis_hex,
-                                    key="t8_seg_map", ss_key="segregation_map",
-                                    apply_admin_bounds=True)
-                    else:
-                        st.info("Segregation map needs transport + diversity layers.")
-                with col_r2:
-                    if _has_cols(analysis_hex, "segregation_score", "compactness", min_rows=5):
-                        _safe_chart(chart_segregation_profile, analysis_hex,
-                                    key="t8_seg_profile", ss_key="segregation_profile")
-                    else:
-                        st.info("Segregation profile needs fabric typology + segregation layers.")
+                if _has_cols(analysis_hex, "segregation_score", min_rows=5):
+                    _safe_chart(chart_segregation_map, analysis_hex,
+                                key="t8_seg_map", ss_key="segregation_map",
+                                apply_admin_bounds=True)
+                    st.caption("Urban Segregation Proxy per H3 cell: composite of mono-functionality (40%), transit isolation (35%), and density isolation (25%, high FAR in mono-functional zone). Source: Overture Maps POI diversity, OSM transit stops, OSM buildings. This is a spatial proxy for functional segregation — not a socioeconomic segregation measure. High values indicate areas that are simultaneously dense, poorly served, and mono-functional.")
 
         _tab_export([
-            ("fabric_matrix",     "Fabric Typology Matrix"),
-            ("fabric_map",        "Fabric Typology Map"),
-            ("morphotype_radar",  "Morphotype Radar"),
-            ("segregation_map",   "Segregation Map"),
-            ("segregation_profile","Segregation Profile"),
+            ("fabric_matrix",   "Fabric Typology Matrix"),
+            ("fabric_map",      "Fabric Typology Map"),
+            ("morphotype_radar","Morphotype Radar"),
+            ("segregation_map", "Segregation Map"),
         ], "tab8")
 
     # ── Tab 9: District Scores ────────────────────────────────────────────────
@@ -1045,6 +1113,7 @@ if analyze:
         else:
             _safe_chart(chart_district_scorecard, district_scores_df,
                         key="t9_scorecard", ss_key="district_scorecard")
+            st.caption("Letter-grade scorecard for each administrative district across five dimensions: transport accessibility, nature access, morphological quality, urban stress, and flood risk. Grades: A (top 25%), B (25–45%), C (45–65%), D (bottom 35%). Source: H3 hex cell metrics spatially joined to OSM administrative boundaries (admin_level 9–10). Minimum 2 hex cells required per district to compute a grade. Districts sorted by overall performance.")
 
             with st.expander("Raw scores table"):
                 st.dataframe(district_scores_df, use_container_width=True)

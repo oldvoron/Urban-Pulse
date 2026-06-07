@@ -266,8 +266,8 @@ def compute_morphological_index(buildings_gdf: gpd.GeoDataFrame, graph) -> dict:
 
     buildings_m["typology"] = buildings_m.apply(_classify, axis=1)
 
-    # Centroids in WGS84 for H3 assignment
-    centroids_wgs = buildings_m.to_crs("EPSG:4326").geometry.centroid
+    # Centroids in WGS84 for H3 assignment (compute in projected CRS to avoid warning)
+    centroids_wgs = buildings_m.geometry.centroid.to_crs("EPSG:4326")
     buildings_m["lat"] = centroids_wgs.y
     buildings_m["lon"] = centroids_wgs.x
     buildings_m = buildings_m.dropna(subset=["lat", "lon"]).reset_index(drop=True)
@@ -312,7 +312,7 @@ def compute_morphological_index(buildings_gdf: gpd.GeoDataFrame, graph) -> dict:
         try:
             edges = ox.graph_to_gdfs(graph, nodes=False)
             edges_wgs = edges.to_crs("EPSG:4326")
-            edge_pts = edges_wgs.geometry.centroid
+            edge_pts = edges.to_crs("EPSG:3857").geometry.centroid.to_crs("EPSG:4326")
             edge_h3 = edge_pts.apply(
                 lambda p: h3.latlng_to_cell(p.y, p.x, 9) if p is not None else None
             ).dropna()
@@ -443,7 +443,7 @@ def _derive_hex_cells(buildings_gdf: gpd.GeoDataFrame):
     b = b[poly_mask].reset_index(drop=True)
     if b.empty:
         return pd.DataFrame(columns=["h3_cell", "lat", "lon"])
-    centroids = b.to_crs("EPSG:4326").geometry.centroid
+    centroids = b.to_crs("EPSG:3857").geometry.centroid.to_crs("EPSG:4326")
     b["lat"] = centroids.y
     b["lon"] = centroids.x
     b = b.dropna(subset=["lat", "lon"])
@@ -517,7 +517,7 @@ def transport_accessibility_index(
         try:
             edges_gdf = ox.graph_to_gdfs(graph, nodes=False)
             edges_wgs = edges_gdf.to_crs("EPSG:4326")
-            edge_centroids = edges_wgs.geometry.centroid
+            edge_centroids = edges_wgs.to_crs("EPSG:3857").geometry.centroid.to_crs("EPSG:4326")
             _types = ["motorway", "primary", "secondary", "tertiary", "residential", "cycleway", "footway"]
 
             def _norm_hw(h):
@@ -552,7 +552,7 @@ def transport_accessibility_index(
             if not cyc_proj.empty:
                 cyc_proj["length"] = cyc_proj.geometry.length
                 cyc_wgs = cyc_proj.to_crs("EPSG:4326")
-                cyc_h3 = cyc_wgs.geometry.centroid.apply(
+                cyc_h3 = cyc_proj.geometry.centroid.to_crs("EPSG:4326").apply(
                     lambda p: h3.latlng_to_cell(p.y, p.x, 9) if p else None
                 )
                 cyc_proj["h3_cell"] = cyc_h3.values
@@ -826,6 +826,16 @@ def compute_urban_stress_index(merged_hex_gdf: gpd.GeoDataFrame) -> gpd.GeoDataF
     except Exception:
         df["stress_level"] = "moderate"
 
+    _comp_map = {
+        "density_stress": density_stress,
+        "green_deficit": green_deficit,
+        "transit_deficit": transit_deficit,
+        "flood_stress": flood_stress,
+        "mono_stress": mono_stress,
+    }
+    comp_df = pd.DataFrame({k: v.values for k, v in _comp_map.items()}, index=df.index)
+    df["dominant_driver"] = comp_df.idxmax(axis=1)
+
     return df
 
 
@@ -1078,6 +1088,16 @@ def sample_terrain_for_hexes(hex_gdf: gpd.GeoDataFrame, terrain_data: dict) -> g
 
 # ── Fallback hex-grid generators ─────────────────────────────────────────────
 
+def select_resolution(poi_count: int) -> int:
+    """Choose H3 resolution based on POI density to avoid over-sparse grids."""
+    if poi_count > 1000:
+        return 9
+    elif poi_count > 100:
+        return 8
+    else:
+        return 7
+
+
 def create_hex_grid_from_bbox(bbox, resolution: int = 9) -> gpd.GeoDataFrame:
     """Create H3 hex grid covering bbox — used when building data is unavailable."""
     if bbox is None:
@@ -1113,10 +1133,12 @@ def create_hex_grid_from_bbox(bbox, resolution: int = 9) -> gpd.GeoDataFrame:
         return gpd.GeoDataFrame()
 
 
-def create_hex_grid_from_pois(poi_df: pd.DataFrame, resolution: int = 9) -> gpd.GeoDataFrame:
+def create_hex_grid_from_pois(poi_df: pd.DataFrame, resolution: int = None) -> gpd.GeoDataFrame:
     """Create H3 hex grid from POI centroids — always works when Overture data loads."""
     if poi_df is None or poi_df.empty:
         return gpd.GeoDataFrame()
+    if resolution is None:
+        resolution = select_resolution(len(poi_df))
     try:
         df = poi_df.dropna(subset=["lat", "lon"]).copy()
         df["h3_cell"] = df.apply(

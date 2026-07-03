@@ -1,4 +1,6 @@
+import gc
 import os
+os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 import concurrent.futures
 import streamlit as st
 import pandas as pd
@@ -110,7 +112,7 @@ def _safe_chart(fn, *args, key: str, ss_key: str = None,
                 )
         if ss_key is not None:
             st.session_state[f"fig_{ss_key}"] = fig
-        st.plotly_chart(fig, use_container_width=True, key=key)
+        st.plotly_chart(fig, width='stretch', key=key)
         return fig
     except Exception as e:
         st.info(f"Chart unavailable: {e}")
@@ -258,7 +260,48 @@ st.title("UrbanPulse — Urban Spatial Analytics")
 
 with st.sidebar:
     st.header("Settings")
-    city_name = st.text_input("City", value="", placeholder="e.g. Lyon, France")
+    city_size = st.selectbox(
+        "City size",
+        ["Small (< 100k)", "Medium (100k–500k)", "Large (500k+)"],
+        index=1,
+        key="city_size",
+    )
+    city_name = st.text_input(
+        "City name",
+        value="",
+        placeholder="e.g. Blois, France",
+        key="city_input",
+    )
+
+    SIZE_CONFIGS = {
+        "Small (< 100k)": {
+            "overture_limit": 5000,
+            "building_limit": 15000,
+            "network_dist": 3000,
+            "hex_resolution": 9,
+            "terrain_grid": 15,
+            "road_tags": ['primary', 'secondary', 'tertiary'],
+        },
+        "Medium (100k–500k)": {
+            "overture_limit": 15000,
+            "building_limit": 25000,
+            "network_dist": 5000,
+            "hex_resolution": 9,
+            "terrain_grid": 20,
+            "road_tags": ['primary', 'secondary', 'tertiary'],
+        },
+        "Large (500k+)": {
+            "overture_limit": 30000,
+            "building_limit": 40000,
+            "network_dist": 8000,
+            "hex_resolution": 8,
+            "terrain_grid": 20,
+            "road_tags": ['primary', 'secondary'],
+        },
+    }
+    config = SIZE_CONFIGS[city_size]
+    st.session_state['config'] = config
+
     analyze = st.button("Analyze", type="primary", use_container_width=True)
     st.markdown("---")
 
@@ -336,31 +379,31 @@ if not city_name.strip():
 
 # ── Cache wrappers ────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=3600)
-def load_pois(city: str, bbox=None) -> pd.DataFrame:
-    return fetch_overture_pois(city, bbox=bbox)
+@st.cache_data(max_entries=1, ttl=1800, show_spinner=False)
+def load_pois(city: str, bbox=None, overture_limit: int = 15000) -> pd.DataFrame:
+    return fetch_overture_pois(city, bbox=bbox, overture_limit=overture_limit)
 
-@st.cache_data(ttl=3600)
-def load_osm(city: str, bbox=None):
-    return fetch_osm_data(city, bbox=bbox)
+@st.cache_data(max_entries=1, ttl=1800, show_spinner=False)
+def load_osm(city: str, bbox=None, network_dist: int = 5000):
+    return fetch_osm_data(city, bbox=bbox, network_dist=network_dist)
 
-@st.cache_data(ttl=3600)
+@st.cache_data(max_entries=1, ttl=1800, show_spinner=False)
 def load_landuse(city: str, bbox=None):
     return fetch_osm_landuse(city, bbox=bbox)
 
-@st.cache_data(ttl=3600)
-def load_transport(city: str, bbox=None) -> dict:
-    return fetch_transport_data(city, bbox=bbox)
+@st.cache_data(max_entries=1, ttl=1800, show_spinner=False)
+def load_transport(city: str, bbox=None, road_tags: tuple = ('primary', 'secondary', 'tertiary')) -> dict:
+    return fetch_transport_data(city, bbox=bbox, road_tags=list(road_tags))
 
-@st.cache_data(ttl=3600)
+@st.cache_data(max_entries=1, ttl=1800, show_spinner=False)
 def load_nature(city: str, bbox=None) -> dict:
     return fetch_nature_data(city, bbox=bbox)
 
-@st.cache_data(ttl=3600)
+@st.cache_data(max_entries=1, ttl=1800, show_spinner=False)
 def load_admin_boundaries(city: str) -> dict:
     return fetch_admin_boundaries(city)
 
-@st.cache_data(ttl=3600)
+@st.cache_data(max_entries=1, ttl=1800, show_spinner=False)
 def load_climate(lat: float, lon: float) -> dict:
     return fetch_climate_data(lat, lon)
 
@@ -407,7 +450,7 @@ if analyze:
                     "flood_risk_proxy": gpd.GeoDataFrame()}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        future_osm = (executor.submit(load_osm, city_name, analysis_bbox)
+        future_osm = (executor.submit(load_osm, city_name, analysis_bbox, config['network_dist'])
                       if (run_morphology or run_transport) else None)
         future_landuse = executor.submit(load_landuse, city_name, analysis_bbox)
         future_nature = (executor.submit(load_nature, city_name, analysis_bbox)
@@ -429,10 +472,19 @@ if analyze:
                 nature_data = future_nature.result()
             except Exception as e:
                 st.warning(f"Nature data fetch failed: {e}")
+    gc.collect()
 
     status.text("Fetching Overture Maps POIs…")
-    poi_df = load_pois(city_name, bbox=analysis_bbox)
+    poi_df = load_pois(city_name, bbox=analysis_bbox, overture_limit=config['overture_limit'])
+    gc.collect()
     poi_df = clip_to_city(poi_df, city_polygon)
+    if len(poi_df) < 50:
+        st.warning(
+            "⚠️ Limited data coverage for this city. "
+            "UrbanPulse works best with cities in Western Europe, "
+            "North America, and Australia where Overture Maps has "
+            "full coverage. Results may be incomplete."
+        )
     status.text(f"✅ POI: {len(poi_df):,} places loaded")
 
     graph = None
@@ -467,7 +519,9 @@ if analyze:
 
     if run_transport:
         status.text("Fetching transport data…")
-        transport_data = load_transport(city_name, bbox=analysis_bbox)
+        transport_data = load_transport(city_name, bbox=analysis_bbox,
+                                        road_tags=tuple(config['road_tags']))
+        gc.collect()
         transport_data["roads"] = clip_to_city(
             transport_data.get("roads", gpd.GeoDataFrame()), city_polygon)
         transport_data["transit_stops"] = clip_to_city(
@@ -491,13 +545,14 @@ if analyze:
 
     status.empty()
 
-    # Sample buildings for metric computation on very large cities — keeps full
-    # buildings_gdf intact for the height distribution chart and stats
-    if buildings_gdf is not None and len(buildings_gdf) > 50000:
-        buildings_sample = buildings_gdf.sample(50000, random_state=42)
-        print(f"[perf] Sampling 50000 from {len(buildings_gdf)} buildings for metrics")
+    # Sample buildings for metric computation — config-based limit
+    _building_cap = config['building_limit']
+    if buildings_gdf is not None and len(buildings_gdf) > _building_cap:
+        buildings_sample = buildings_gdf.sample(_building_cap, random_state=42)
+        print(f"[perf] Sampling {_building_cap} from {len(buildings_gdf)} buildings for metrics")
     else:
         buildings_sample = buildings_gdf
+    gc.collect()
 
     # Step 3: Core metrics
     with st.spinner("Computing core metrics…"):
@@ -542,6 +597,7 @@ if analyze:
         except Exception as e:
             st.warning(f"Land use composition failed: {e}")
             lu_metrics = {}
+    gc.collect()
 
     # Step 4: Accessibility
     with st.spinner("Computing transport & nature accessibility…"):
@@ -568,6 +624,7 @@ if analyze:
         except Exception as e:
             st.warning(f"Nature accessibility failed: {e}")
             nature_hex = gpd.GeoDataFrame()
+    gc.collect()
 
     # Step 5: Build merged hex GDF — with POI/bbox fallback when buildings unavailable
     hex_metrics     = morph_data.get("hex_metrics", gpd.GeoDataFrame())
@@ -577,7 +634,7 @@ if analyze:
         st.warning("Building data unavailable — using POI hex grid as base layer")
         poi_hex = create_hex_grid_from_pois(poi_df)
         if poi_hex.empty and analysis_bbox:
-            poi_hex = create_hex_grid_from_bbox(analysis_bbox, resolution=9)
+            poi_hex = create_hex_grid_from_bbox(analysis_bbox, resolution=config['hex_resolution'])
         hex_metrics = poi_hex
 
     merged_hex = hex_metrics.copy()
@@ -604,6 +661,15 @@ if analyze:
     # Clip merged hex to city boundary
     merged_hex = clip_to_city(merged_hex, city_polygon)
 
+    # Drop unused columns to reduce memory footprint
+    _keep_cols = ['h3_cell', 'lat', 'lon', 'geometry', 'FAR', 'BCR', 'CMI',
+                  'transport_index', 'nature_index', 'urban_stress',
+                  'diversity_score', 'cluster', 'terrain_flood_risk',
+                  'elevation_m', 'green_space_ratio', 'flood_risk_tier',
+                  'dominant_driver', 'vulnerability_score', 'segregation_score']
+    merged_hex = merged_hex[[c for c in _keep_cols if c in merged_hex.columns]].copy()
+    gc.collect()
+
     # Step 6: Terrain
     terrain_data: dict = {}
     if run_terrain:
@@ -620,9 +686,11 @@ if analyze:
                 else:
                     _tbbox = None
                 if _tbbox:
-                    terrain_data = fetch_terrain_data(city_name, _tbbox)
+                    terrain_data = fetch_terrain_data(city_name, _tbbox,
+                                                      terrain_grid=config['terrain_grid'])
             except Exception as e:
                 st.warning(f"Terrain data fetch failed: {e}")
+        gc.collect()
 
     # Step 7: Advanced analytics
     with st.spinner("Computing advanced analytics…"):
@@ -648,6 +716,7 @@ if analyze:
                 analysis_hex = _fn(analysis_hex)
             except Exception as e:
                 st.warning(f"Failed to compute {_label}: {e}")
+    gc.collect()
 
     # Population density proxy (buildings × 3.5 persons per unit)
     if not analysis_hex.empty and 'BCR' in analysis_hex.columns:
@@ -666,6 +735,7 @@ if analyze:
                     analysis_hex = sample_terrain_for_hexes(analysis_hex, terrain_data)
             except Exception as e:
                 st.warning(f"Terrain sampling failed: {e}")
+        gc.collect()
 
     # Step 9: Scalar summaries
     total_buildings = (
@@ -673,6 +743,8 @@ if analyze:
         else len(buildings_gdf) if buildings_gdf is not None and not buildings_gdf.empty
         else 0
     )
+    del buildings_raw
+    gc.collect()
     total_pois      = len(poi_df) if not poi_df.empty else 0
     green_pct       = lu_metrics.get("green_space_ratio", 0.0) * 100
     dominant_morphotype = (
@@ -1201,6 +1273,11 @@ if analyze:
                 st.code(insights, language=None)
         else:
             st.info("Add ANTHROPIC_API_KEY to .env to enable AI insights.")
+
+    # Free large data structures after figures are stored in session_state
+    del buildings_gdf, buildings_sample, poi_df, landuse_gdf
+    del transport_data, nature_data
+    gc.collect()
 
     st.session_state["analysis_done"] = True
     st.session_state["city_name"] = city_name

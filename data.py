@@ -7,7 +7,7 @@ import time
 def configure_osmnx():
     """Configure osmnx with retry-friendly settings."""
     ox.settings.timeout = 180
-    ox.settings.max_query_area_size = 50_000_000_000
+    ox.settings.max_query_area_size = 25_000_000_000
     ox.settings.overpass_rate_limit = False
     ox.settings.overpass_url = "https://overpass-api.de/api/interpreter"
 
@@ -36,7 +36,7 @@ def osmnx_fetch_with_retry(fetch_func, max_retries=3, delay=3):
 
 # ── Overture Maps ─────────────────────────────────────────────────────────────
 
-def fetch_overture_pois(city_name: str, bbox=None) -> pd.DataFrame:
+def fetch_overture_pois(city_name: str, bbox=None, overture_limit: int = 15000) -> pd.DataFrame:
     """
     Fetch POIs from Overture Maps using the overturemaps Python package (primary)
     with DuckDB S3 as fallback. Returns DataFrame with [name, category, lat, lon].
@@ -92,6 +92,8 @@ def fetch_overture_pois(city_name: str, bbox=None) -> pd.DataFrame:
             df[["lon", "lat"]] = df["geometry"].apply(lambda g: pd.Series(_xy(g)))
 
         df = df.dropna(subset=["lat", "lon"])
+        if len(df) > overture_limit:
+            df = df.head(overture_limit)
         print(f"[overture] package: {len(df)} places")
         return df[["name", "category", "lat", "lon"]]
 
@@ -117,7 +119,7 @@ def fetch_overture_pois(city_name: str, bbox=None) -> pd.DataFrame:
             )
             WHERE bbox.minx BETWEEN {min_lon} AND {max_lon}
               AND bbox.miny BETWEEN {min_lat} AND {max_lat}
-            LIMIT 5000
+            LIMIT {overture_limit}
         """
         df = con.execute(q).df()
         con.close()
@@ -144,10 +146,10 @@ def _osm_features(city_name: str, bbox, tags: dict) -> gpd.GeoDataFrame:
 
 # ── Street network & buildings ────────────────────────────────────────────────
 
-def fetch_osm_data(city_name: str, bbox=None) -> dict:
+def fetch_osm_data(city_name: str, bbox=None, network_dist: int = 5000) -> dict:
     """Return {'graph': G|None, 'buildings': GeoDataFrame|None}."""
     ox.settings.timeout = 180
-    ox.settings.max_query_area_size = 50_000_000_000
+    ox.settings.max_query_area_size = 25_000_000_000
 
     result = {"graph": None, "buildings": None}
 
@@ -165,7 +167,7 @@ def fetch_osm_data(city_name: str, bbox=None) -> dict:
         print(f"[OSM] Street network failed: {e}")
         try:
             loc = ox.geocode(city_name)
-            G = osmnx_fetch_with_retry(lambda: ox.graph_from_point(loc, dist=3000, network_type="walk"))
+            G = osmnx_fetch_with_retry(lambda: ox.graph_from_point(loc, dist=network_dist, network_type="walk"))
             if G is not None:
                 result["graph"] = G
                 print(f"[OSM] Fallback point network: {len(G.nodes)} nodes")
@@ -193,19 +195,21 @@ def fetch_osm_data(city_name: str, bbox=None) -> dict:
 
 # ── Transport data ────────────────────────────────────────────────────────────
 
-def fetch_transport_data(city_name: str, bbox=None) -> dict:
+def fetch_transport_data(city_name: str, bbox=None,
+                         road_tags: list = None) -> dict:
     ox.settings.timeout = 180
+    if road_tags is None:
+        road_tags = ['primary', 'secondary', 'tertiary']
     result = {
         "roads": gpd.GeoDataFrame(),
         "transit_stops": gpd.GeoDataFrame(),
         "cycling": gpd.GeoDataFrame(),
     }
 
-    # Roads — major roads only; minor roads (residential/service/footway/etc.)
-    # add ~80% of data volume but contribute little to the analytics
+    # Roads — filtered by config road_tags to control data volume
     try:
         roads = _osm_features(city_name, bbox,
-                              {"highway": ["motorway", "trunk", "primary", "secondary", "tertiary"]})
+                              {"highway": road_tags})
         roads = roads[roads.geometry.geom_type.isin(["LineString", "MultiLineString"])].copy()
         if "highway" not in roads.columns:
             roads["highway"] = "other"
@@ -389,9 +393,9 @@ def fetch_osm_landuse(city_name: str, bbox=None) -> gpd.GeoDataFrame:
 
 # ── Terrain (elevation) ───────────────────────────────────────────────────────
 
-def fetch_terrain_data(city_name: str, bbox: tuple) -> dict:
+def fetch_terrain_data(city_name: str, bbox: tuple, terrain_grid: int = 20) -> dict:
     """
-    Fetch elevation from Open-Meteo over a 30×30 grid within bbox.
+    Fetch elevation from Open-Meteo over a terrain_grid×terrain_grid grid within bbox.
     bbox = (min_lon, min_lat, max_lon, max_lat)
     """
     import requests
@@ -401,8 +405,8 @@ def fetch_terrain_data(city_name: str, bbox: tuple) -> dict:
         return {"elevation_grid": None}
 
     min_lon, min_lat, max_lon, max_lat = bbox
-    lat_steps = np.linspace(min_lat, max_lat, 20)
-    lon_steps = np.linspace(min_lon, max_lon, 20)
+    lat_steps = np.linspace(min_lat, max_lat, terrain_grid)
+    lon_steps = np.linspace(min_lon, max_lon, terrain_grid)
     grid_lats, grid_lons = np.meshgrid(lat_steps, lon_steps)
     grid_lats = grid_lats.flatten()
     grid_lons = grid_lons.flatten()

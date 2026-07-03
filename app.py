@@ -253,7 +253,17 @@ def clip_to_city(data, city_polygon):
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="UrbanPulse", page_icon="🏙️", layout="wide")
+st.set_page_config(
+    page_title="UrbanPulse",
+    page_icon="🏙️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+if 'initialized' not in st.session_state:
+    st.session_state.clear()
+    st.session_state['initialized'] = True
+
 st.title("UrbanPulse — Urban Spatial Analytics")
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -376,6 +386,10 @@ if not city_name.strip():
     st.info("Enter a city name in the sidebar to begin analysis.")
     st.stop()
 
+SKIP_MODULES = (
+    ['segregation', 'vulnerability', 'fabric_typology']
+    if city_size == "Small (< 100k)" else []
+)
 
 # ── Cache wrappers ────────────────────────────────────────────────────────────
 
@@ -408,6 +422,36 @@ def load_climate(lat: float, lon: float) -> dict:
     return fetch_climate_data(lat, lon)
 
 
+def _run_parallel_fetches(city_name, analysis_bbox, config,
+                           run_morph, run_transport, run_nature, run_terrain):
+    """Fetch all data sources simultaneously using a thread pool."""
+    futures_map = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+        futures_map['poi'] = executor.submit(
+            load_pois, city_name, analysis_bbox, config['overture_limit'])
+        futures_map['landuse'] = executor.submit(load_landuse, city_name, analysis_bbox)
+        if run_morph:
+            futures_map['osm'] = executor.submit(
+                load_osm, city_name, analysis_bbox, config['network_dist'])
+        if run_transport:
+            futures_map['transport'] = executor.submit(
+                load_transport, city_name, analysis_bbox, tuple(config['road_tags']))
+        if run_nature:
+            futures_map['nature'] = executor.submit(load_nature, city_name, analysis_bbox)
+        if run_terrain and analysis_bbox:
+            futures_map['terrain'] = executor.submit(
+                fetch_terrain_data, city_name, analysis_bbox, config['terrain_grid'])
+
+        results = {}
+        for key, future in futures_map.items():
+            try:
+                results[key] = future.result(timeout=120)
+            except Exception as e:
+                print(f"[parallel] {key} failed: {e}")
+                results[key] = None
+    return results
+
+
 # ── Analysis pipeline ─────────────────────────────────────────────────────────
 
 if analyze:
@@ -429,9 +473,6 @@ if analyze:
             st.session_state['admin_boundaries'] = admin_boundaries
             st.session_state['last_city'] = city_name
 
-        if not admin_boundaries.get('has_districts', False):
-            st.info("No sub-city districts found — showing city boundary only.")
-
     city_polygon = get_city_polygon(admin_boundaries)
     st.session_state['city_polygon'] = city_polygon
 
@@ -440,62 +481,45 @@ if analyze:
         city_name, zone_mode, selected_district, admin_boundaries, custom_bbox
     )
 
-    # Step 2: Fetch data
+    # Step 2: Fetch all data sources in parallel
     status = st.empty()
-
-    status.text("Fetching OSM street network, land use & nature data in parallel…")
-    osm_result   = {"graph": None, "buildings": None}
-    landuse_gdf  = gpd.GeoDataFrame()
-    nature_data  = {"green_spaces": gpd.GeoDataFrame(), "water_bodies": gpd.GeoDataFrame(),
-                    "flood_risk_proxy": gpd.GeoDataFrame()}
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-        future_osm = (executor.submit(load_osm, city_name, analysis_bbox, config['network_dist'])
-                      if (run_morphology or run_transport) else None)
-        future_landuse = executor.submit(load_landuse, city_name, analysis_bbox)
-        future_nature = (executor.submit(load_nature, city_name, analysis_bbox)
-                         if run_nature else None)
-
-        if future_osm is not None:
-            try:
-                osm_result = future_osm.result()
-            except Exception as e:
-                st.warning(f"OSM fetch failed: {e}")
-
-        try:
-            landuse_gdf = future_landuse.result()
-        except Exception as e:
-            st.warning(f"Land use fetch failed: {e}")
-
-        if future_nature is not None:
-            try:
-                nature_data = future_nature.result()
-            except Exception as e:
-                st.warning(f"Nature data fetch failed: {e}")
-    gc.collect()
-
-    status.text("Fetching Overture Maps POIs…")
-    poi_df = load_pois(city_name, bbox=analysis_bbox, overture_limit=config['overture_limit'])
-    gc.collect()
-    poi_df = clip_to_city(poi_df, city_polygon)
-    if len(poi_df) < 50:
-        st.warning(
-            "⚠️ Limited data coverage for this city. "
-            "UrbanPulse works best with cities in Western Europe, "
-            "North America, and Australia where Overture Maps has "
-            "full coverage. Results may be incomplete."
+    with st.spinner("Fetching all data sources…"):
+        all_data = _run_parallel_fetches(
+            city_name, analysis_bbox, config,
+            run_morph=(run_morphology or run_transport),
+            run_transport=run_transport,
+            run_nature=run_nature,
+            run_terrain=run_terrain,
         )
-    status.text(f"✅ POI: {len(poi_df):,} places loaded")
+    gc.collect()
+
+    poi_df_raw = all_data.get('poi') or pd.DataFrame(columns=["name", "category", "lat", "lon"])
+    osm_result = all_data.get('osm') or {"graph": None, "buildings": None}
+    landuse_gdf = all_data.get('landuse') or gpd.GeoDataFrame()
+    transport_data = all_data.get('transport') or {
+        "roads": gpd.GeoDataFrame(), "transit_stops": gpd.GeoDataFrame(), "cycling": gpd.GeoDataFrame()}
+    nature_data = all_data.get('nature') or {
+        "green_spaces": gpd.GeoDataFrame(), "water_bodies": gpd.GeoDataFrame(),
+        "flood_risk_proxy": gpd.GeoDataFrame()}
+    terrain_data = all_data.get('terrain') or {}
+
+    poi_df = clip_to_city(poi_df_raw, city_polygon)
+    del poi_df_raw
+    if poi_df is None or len(poi_df) == 0:
+        st.error("❌ No data found for this city. Make sure to include the country, e.g. 'Blois, France'")
+        st.stop()
+    elif len(poi_df) < 15:
+        st.warning("⚠️ Very few POIs found. Results may be incomplete.")
+    status.text(f"✅ Data fetched: {len(poi_df):,} POIs")
 
     graph = None
-    buildings_raw = None          # raw GeoDataFrame from OSM (all columns)
+    buildings_raw = None
     buildings_gdf = gpd.GeoDataFrame(columns=["geometry", "height"])
 
     if run_morphology or run_transport:
         graph = osm_result.get("graph")
         buildings_raw = osm_result.get("buildings")
 
-        # Clip raw buildings, then normalise → ['geometry', 'height']
         if buildings_raw is not None and not buildings_raw.empty:
             try:
                 b = buildings_raw.copy()
@@ -510,38 +534,19 @@ if analyze:
             except Exception as e:
                 st.warning(f"Building normalisation failed: {e}")
 
-        n_nodes = len(graph.nodes) if graph else 0
-        n_bld   = len(buildings_gdf)
-        status.text(f"✅ OSM: {n_nodes:,} street nodes, {n_bld:,} buildings")
-
     landuse_gdf = clip_to_city(landuse_gdf, city_polygon)
-    status.text(f"✅ Land use: {len(landuse_gdf):,} polygons")
 
     if run_transport:
-        status.text("Fetching transport data…")
-        transport_data = load_transport(city_name, bbox=analysis_bbox,
-                                        road_tags=tuple(config['road_tags']))
-        gc.collect()
         transport_data["roads"] = clip_to_city(
             transport_data.get("roads", gpd.GeoDataFrame()), city_polygon)
         transport_data["transit_stops"] = clip_to_city(
             transport_data.get("transit_stops", gpd.GeoDataFrame()), city_polygon)
-        n_stops = len(transport_data.get("transit_stops", gpd.GeoDataFrame()))
-        status.text(f"✅ Transport: {n_stops:,} transit stops")
-    else:
-        transport_data = {"roads": gpd.GeoDataFrame(), "transit_stops": gpd.GeoDataFrame(),
-                          "cycling": gpd.GeoDataFrame()}
 
     if run_nature:
         nature_data["green_spaces"] = clip_to_city(
             nature_data.get("green_spaces", gpd.GeoDataFrame()), city_polygon)
         nature_data["water_bodies"] = clip_to_city(
             nature_data.get("water_bodies", gpd.GeoDataFrame()), city_polygon)
-        n_green = len(nature_data.get("green_spaces", gpd.GeoDataFrame()))
-        status.text(f"✅ Nature: {n_green:,} green space polygons")
-    else:
-        nature_data = {"green_spaces": gpd.GeoDataFrame(), "water_bodies": gpd.GeoDataFrame(),
-                       "flood_risk_proxy": gpd.GeoDataFrame()}
 
     status.empty()
 
@@ -670,28 +675,6 @@ if analyze:
     merged_hex = merged_hex[[c for c in _keep_cols if c in merged_hex.columns]].copy()
     gc.collect()
 
-    # Step 6: Terrain
-    terrain_data: dict = {}
-    if run_terrain:
-        with st.spinner("Fetching terrain elevation data…"):
-            try:
-                if analysis_bbox:
-                    _tbbox = analysis_bbox
-                elif not poi_df.empty:
-                    _tbbox = (float(poi_df["lon"].min()), float(poi_df["lat"].min()),
-                              float(poi_df["lon"].max()), float(poi_df["lat"].max()))
-                elif not hex_metrics.empty and "lon" in hex_metrics.columns:
-                    _tbbox = (float(hex_metrics["lon"].min()), float(hex_metrics["lat"].min()),
-                              float(hex_metrics["lon"].max()), float(hex_metrics["lat"].max()))
-                else:
-                    _tbbox = None
-                if _tbbox:
-                    terrain_data = fetch_terrain_data(city_name, _tbbox,
-                                                      terrain_grid=config['terrain_grid'])
-            except Exception as e:
-                st.warning(f"Terrain data fetch failed: {e}")
-        gc.collect()
-
     # Step 7: Advanced analytics
     with st.spinner("Computing advanced analytics…"):
         analysis_hex = merged_hex.copy()
@@ -702,20 +685,23 @@ if analyze:
             except Exception as e:
                 st.warning(f"Failed to compute urban stress: {e}")
 
-        if run_typology:
+        if run_typology and 'fabric_typology' not in SKIP_MODULES:
             try:
                 analysis_hex = compute_fabric_typology(analysis_hex)
             except Exception as e:
                 st.warning(f"Failed to compute fabric typology: {e}")
 
-        for _fn, _label in [
-            (compute_temporal_vulnerability, "temporal vulnerability"),
-            (compute_segregation_proxy,      "segregation proxy"),
-        ]:
+        if 'vulnerability' not in SKIP_MODULES:
             try:
-                analysis_hex = _fn(analysis_hex)
+                analysis_hex = compute_temporal_vulnerability(analysis_hex)
             except Exception as e:
-                st.warning(f"Failed to compute {_label}: {e}")
+                st.warning(f"Failed to compute temporal vulnerability: {e}")
+
+        if 'segregation' not in SKIP_MODULES:
+            try:
+                analysis_hex = compute_segregation_proxy(analysis_hex)
+            except Exception as e:
+                st.warning(f"Failed to compute segregation proxy: {e}")
     gc.collect()
 
     # Population density proxy (buildings × 3.5 persons per unit)

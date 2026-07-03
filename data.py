@@ -6,7 +6,7 @@ import time
 
 def configure_osmnx():
     """Configure osmnx with retry-friendly settings."""
-    ox.settings.timeout = 180
+    ox.settings.timeout = 45
     ox.settings.max_query_area_size = 25_000_000_000
     ox.settings.overpass_rate_limit = False
     ox.settings.overpass_url = "https://overpass-api.de/api/interpreter"
@@ -15,7 +15,7 @@ def configure_osmnx():
 configure_osmnx()
 
 
-def osmnx_fetch_with_retry(fetch_func, max_retries=3, delay=3):
+def osmnx_fetch_with_retry(fetch_func, max_retries=2, delay=3):
     """Retry osmnx fetch with exponential backoff on connection errors (max ~9s total wait)."""
     for attempt in range(max_retries):
         try:
@@ -148,7 +148,7 @@ def _osm_features(city_name: str, bbox, tags: dict) -> gpd.GeoDataFrame:
 
 def fetch_osm_data(city_name: str, bbox=None, network_dist: int = 5000) -> dict:
     """Return {'graph': G|None, 'buildings': GeoDataFrame|None}."""
-    ox.settings.timeout = 180
+    ox.settings.timeout = 45
     ox.settings.max_query_area_size = 25_000_000_000
 
     result = {"graph": None, "buildings": None}
@@ -197,7 +197,7 @@ def fetch_osm_data(city_name: str, bbox=None, network_dist: int = 5000) -> dict:
 
 def fetch_transport_data(city_name: str, bbox=None,
                          road_tags: list = None) -> dict:
-    ox.settings.timeout = 180
+    ox.settings.timeout = 45
     if road_tags is None:
         road_tags = ['primary', 'secondary', 'tertiary']
     result = {
@@ -264,7 +264,7 @@ def fetch_transport_data(city_name: str, bbox=None,
 # ── Nature & green space ──────────────────────────────────────────────────────
 
 def fetch_nature_data(city_name: str, bbox=None) -> dict:
-    ox.settings.timeout = 180
+    ox.settings.timeout = 45
     result = {
         "green_spaces": gpd.GeoDataFrame(),
         "water_bodies": gpd.GeoDataFrame(),
@@ -338,7 +338,7 @@ def fetch_nature_data(city_name: str, bbox=None) -> dict:
 # ── Land use ──────────────────────────────────────────────────────────────────
 
 def fetch_osm_landuse(city_name: str, bbox=None) -> gpd.GeoDataFrame:
-    ox.settings.timeout = 180
+    ox.settings.timeout = 45
     poly_types = {"Polygon", "MultiPolygon"}
     gdfs = []
 

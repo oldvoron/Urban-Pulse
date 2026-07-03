@@ -10,11 +10,11 @@ from plotly.subplots import make_subplots
 from shapely.geometry import Polygon
 
 MORPHOTYPE_COLORS = {
-    "historic_core": "#8B1A1A",
-    "dense_urban":   "#D4691E",
-    "mixed_mid":     "#DAA520",
-    "suburban":      "#2E8B57",
-    "industrial":    "#4682B4",
+    "historic_core":       "#8B1A1A",
+    "dense_urban":         "#D4691E",
+    "residential":         "#DAA520",
+    "suburban":            "#2E8B57",
+    "low_rise_commercial": "#4682B4",
 }
 
 _LANDUSE_COLORS = {
@@ -507,16 +507,36 @@ def chart_nature_radar(nature_metrics_dict: dict) -> go.Figure:
 
 # ── Cross-reference diamond heatmaps ─────────────────────────────────────────
 
+def _safe_quintile(series, n=5):
+    """Create quintile bins even when values have low variance"""
+    series = pd.to_numeric(series, errors="coerce").dropna()
+    if len(series) < n:
+        return None
+    labels = [f"Q{i+1}" for i in range(n)]
+    if series.std() < 1e-6:
+        try:
+            return pd.cut(series, bins=n, labels=labels, include_lowest=True, duplicates="drop")
+        except Exception:
+            return None
+    try:
+        return pd.qcut(series, n, labels=labels, duplicates="drop")
+    except Exception:
+        try:
+            return pd.qcut(series, min(n, series.nunique()), duplicates="drop")
+        except Exception:
+            return None
+
+
 def _quintile_crosstab(hex_gdf, col_x: str, col_y: str, value_col: str = None):
     df = hex_gdf[[col_x, col_y] + ([value_col] if value_col else [])].dropna()
     if len(df) < 5:
         return None, None
-    q_labels = ["Q1", "Q2", "Q3", "Q4", "Q5"]
-    try:
-        df["x_q"] = pd.qcut(df[col_x], 5, labels=q_labels, duplicates="drop")
-        df["y_q"] = pd.qcut(df[col_y], 5, labels=q_labels, duplicates="drop")
-    except Exception:
+    x_q = _safe_quintile(df[col_x])
+    y_q = _safe_quintile(df[col_y])
+    if x_q is None or y_q is None:
         return None, None
+    df["x_q"] = x_q.reindex(df.index)
+    df["y_q"] = y_q.reindex(df.index)
     df = df.dropna(subset=["x_q", "y_q"])
     if df.empty:
         return None, None
@@ -535,11 +555,13 @@ def _quintile_crosstab(hex_gdf, col_x: str, col_y: str, value_col: str = None):
 def chart_cross_heatmap_morph_transport(hex_gdf) -> go.Figure:
     if hex_gdf is None or hex_gdf.empty:
         return _empty("No merged hex data available", 450)
+    if len(hex_gdf) < 20:
+        return _empty("Insufficient data for cross-analysis", 450)
     if "CMI" not in hex_gdf.columns or "transport_index" not in hex_gdf.columns:
         return _empty("Need CMI and transport_index columns", 450)
     cross_tab, text = _quintile_crosstab(hex_gdf, "CMI", "transport_index")
     if cross_tab is None:
-        return _empty("Insufficient data for cross-analysis", 450)
+        return _empty("Insufficient data variance for cross-analysis", 450)
     col_sums = cross_tab.values.sum(axis=0)
     row_sums = cross_tab.values.sum(axis=1)
     x_labels = [str(c) for c in cross_tab.columns]
@@ -573,11 +595,13 @@ def chart_cross_heatmap_morph_transport(hex_gdf) -> go.Figure:
 def chart_cross_heatmap_nature_morph(hex_gdf) -> go.Figure:
     if hex_gdf is None or hex_gdf.empty:
         return _empty("No merged hex data available", 450)
+    if len(hex_gdf) < 20:
+        return _empty("Insufficient data for cross-analysis", 450)
     if "green_space_ratio" not in hex_gdf.columns or "FAR" not in hex_gdf.columns:
         return _empty("Need green_space_ratio and FAR columns", 450)
     cross_tab, text = _quintile_crosstab(hex_gdf, "green_space_ratio", "FAR", value_col="CMI")
     if cross_tab is None:
-        return _empty("Insufficient data for cross-analysis", 450)
+        return _empty("Insufficient data variance for cross-analysis", 450)
     col_sums = cross_tab.values.sum(axis=0)
     row_sums = cross_tab.values.sum(axis=1)
     x_labels = [str(c) for c in cross_tab.columns]
@@ -611,6 +635,8 @@ def chart_cross_heatmap_nature_morph(hex_gdf) -> go.Figure:
 def chart_cross_heatmap_transport_nature(hex_gdf) -> go.Figure:
     if hex_gdf is None or hex_gdf.empty:
         return _empty("No merged hex data available", 450)
+    if len(hex_gdf) < 20:
+        return _empty("Insufficient data for cross-analysis", 450)
     if "transit_score" not in hex_gdf.columns and "transport_index" not in hex_gdf.columns:
         return _empty("Need transit_score or transport_index column", 450)
     if "nature_index" not in hex_gdf.columns:
@@ -618,7 +644,7 @@ def chart_cross_heatmap_transport_nature(hex_gdf) -> go.Figure:
     x_col = "transit_score" if "transit_score" in hex_gdf.columns else "transport_index"
     cross_tab, text = _quintile_crosstab(hex_gdf, x_col, "nature_index")
     if cross_tab is None:
-        return _empty("Insufficient data for cross-analysis", 450)
+        return _empty("Insufficient data variance for cross-analysis", 450)
     col_sums = cross_tab.values.sum(axis=0)
     row_sums = cross_tab.values.sum(axis=1)
     x_labels = [str(c) for c in cross_tab.columns]
@@ -783,66 +809,148 @@ def chart_urban_quality_index(hex_gdf_merged) -> go.Figure:
     return fig
 
 
-def chart_density_gradient(buildings_gdf: gpd.GeoDataFrame,
-                            city_center_lat: float, city_center_lon: float,
-                            poi_df=None) -> go.Figure:
+def chart_density_gradient(buildings_gdf: gpd.GeoDataFrame, poi_df=None,
+                            city_center_lat: float = None, city_center_lon: float = None) -> go.Figure:
+    """N-S and E-W cross-sections of Floor Volume Ratio (FVR) through the city center"""
     if buildings_gdf is None or buildings_gdf.empty:
-        return _empty("No building data for density gradient")
-    if "height" not in buildings_gdf.columns:
-        return _empty("No building height data for density gradient")
-    b = buildings_gdf.copy().reset_index(drop=True)
-    if b.crs is None: b = b.set_crs("EPSG:4326")
+        return _empty("No building data for density cross-sections")
+    if city_center_lat is None or city_center_lon is None:
+        return _empty("No city center coordinates")
+
+    b = buildings_gdf.copy()
+    if b.crs is None:
+        b = b.set_crs("EPSG:4326")
     b_m = b.to_crs("EPSG:3857")
-    center_pt = gpd.GeoDataFrame(
+
+    b_m["footprint_m2"] = b_m.geometry.area
+
+    def estimate_height(row):
+        for tag in ["height", "building:height"]:
+            val = row.get(tag)
+            if val is not None and pd.notna(val):
+                try:
+                    h = float(str(val).replace("m", "").strip())
+                    if 2 < h < 300:
+                        return h
+                except Exception:
+                    pass
+        for tag in ["building:levels", "levels"]:
+            val = row.get(tag)
+            if val is not None and pd.notna(val):
+                try:
+                    lvl = float(val)
+                    if 0 < lvl < 100:
+                        return lvl * 3.5
+                except Exception:
+                    pass
+        btype = str(row.get("building", "")).lower()
+        defaults = {
+            "apartments": 10.5, "residential": 7.0, "house": 5.0,
+            "commercial": 14.0, "office": 17.5, "retail": 7.0,
+            "industrial": 6.0, "warehouse": 5.5, "garage": 3.0,
+            "church": 12.0, "school": 8.0,
+        }
+        return defaults.get(btype, 8.0)
+
+    b_m["height_m"] = b_m.apply(estimate_height, axis=1)
+    b_m["floor_volume"] = b_m["footprint_m2"] * b_m["height_m"]
+
+    b_m = b_m[b_m["footprint_m2"].between(10, 50000)]
+    b_m = b_m[b_m["height_m"].between(2, 300)]
+    if b_m.empty:
+        return _empty("No valid building geometry after filtering")
+
+    center_m = gpd.GeoDataFrame(
         geometry=gpd.points_from_xy([city_center_lon], [city_center_lat]), crs="EPSG:4326"
-    ).to_crs("EPSG:3857").geometry[0]
-    b_m["dist_m"]    = b_m.geometry.centroid.distance(center_pt)
-    b_m["height_num"] = pd.to_numeric(b_m["height"], errors="coerce")
-    b_m = b_m.dropna(subset=["height_num", "dist_m"])
-    b_m = b_m[b_m["height_num"].between(0, 200)].copy()
-    if b_m.empty: return _empty("Insufficient height data for density gradient")
-    b_m["dist_band"] = (b_m["dist_m"] // 200 * 200).astype(int)
-    bh = b_m.groupby("dist_band")["height_num"].mean().reset_index()
-    bh.columns = ["dist_m", "mean_height"]
-    bh = bh.sort_values("dist_m")
-    bh["smooth"] = bh["mean_height"].rolling(window=3, center=True, min_periods=1).mean()
-    max_h = bh["smooth"].max() if not bh.empty else 1
-    norm = bh["smooth"] / max(max_h, 1)
-    clrs = [f"rgba({int(20+180*(1-v))},{int(20+60*(1-v))},{int(100+100*(1-v))},0.8)" for v in norm]
-    has_poi = (poi_df is not None and not poi_df.empty
-               and "lat" in poi_df.columns and "lon" in poi_df.columns)
-    layout_kw = dict(yaxis2=dict(title="POI Density", overlaying="y", side="right",
-                                 showgrid=False)) if has_poi else {}
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=bh["dist_m"] / 1000, y=bh["smooth"],
-        fill="tozeroy", mode="lines+markers",
-        line=dict(color="#2C3E50", width=2),
-        fillcolor="rgba(52,152,219,0.15)",
-        marker=dict(color=clrs, size=6), name="Mean Height",
-    ))
-    if has_poi:
-        try:
-            p = poi_df.copy()
-            p_gdf = gpd.GeoDataFrame(geometry=gpd.points_from_xy(p["lon"], p["lat"]),
-                                     crs="EPSG:4326").to_crs("EPSG:3857")
-            p_dist = p_gdf.geometry.distance(center_pt)
-            p_band = (p_dist // 200 * 200).astype(int)
-            poi_counts = p_band.value_counts().sort_index().reset_index()
-            poi_counts.columns = ["dist_m", "poi_count"]
-            fig.add_trace(go.Scatter(
-                x=poi_counts["dist_m"] / 1000, y=poi_counts["poi_count"],
-                mode="lines", line=dict(color="#E74C3C", width=1.5, dash="dot"),
-                name="POI Density", yaxis="y2",
-            ))
-        except Exception:
-            pass
+    ).to_crs("EPSG:3857").geometry.iloc[0]
+    cx, cy = center_m.x, center_m.y
+
+    centroids = b_m.geometry.centroid
+    b_m["bx"] = centroids.x
+    b_m["by"] = centroids.y
+
+    b_m["ns_km"] = (b_m["by"] - cy) / 1000  # positive = north
+    b_m["ew_km"] = (b_m["bx"] - cx) / 1000  # positive = east
+
+    band_km = 0.3
+    band_area_m2 = (band_km * 1000) ** 2
+
+    b_m["ns_band"] = (b_m["ns_km"] / band_km).round(0) * band_km
+    b_m["ew_band"] = (b_m["ew_km"] / band_km).round(0) * band_km
+
+    ns = b_m.groupby("ns_band").agg(
+        fvr=("floor_volume", "sum"),
+        count=("floor_volume", "count"),
+    ).reset_index()
+    ns["fvr"] = ns["fvr"] / band_area_m2
+    ns = ns[ns["count"] >= 2].sort_values("ns_band")
+
+    ew = b_m.groupby("ew_band").agg(
+        fvr=("floor_volume", "sum"),
+        count=("floor_volume", "count"),
+    ).reset_index()
+    ew["fvr"] = ew["fvr"] / band_area_m2
+    ew = ew[ew["count"] >= 2].sort_values("ew_band")
+
+    if ns.empty and ew.empty:
+        return _empty("Insufficient building data for cross-sections")
+
+    ns["smooth"] = ns["fvr"].rolling(3, center=True, min_periods=1).mean()
+    ew["smooth"] = ew["fvr"].rolling(3, center=True, min_periods=1).mean()
+
+    fig = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=(
+            "North ↑  |  City Center  |  South ↓",
+            "West ←  |  City Center  |  East →",
+        ),
+        shared_yaxes=True,
+        horizontal_spacing=0.08,
+    )
+
+    if not ns.empty:
+        fig.add_trace(go.Scatter(
+            x=ns["ns_band"], y=ns["smooth"],
+            mode="lines", fill="tozeroy",
+            line=dict(color="#2980B9", width=2.5, shape="spline", smoothing=0.8),
+            fillcolor="rgba(41,128,185,0.15)",
+            name="N–S density",
+            hovertemplate="%{x:.1f} km from center<br>Density: %{y:.3f}<extra></extra>",
+        ), row=1, col=1)
+
+    if not ew.empty:
+        fig.add_trace(go.Scatter(
+            x=ew["ew_band"], y=ew["smooth"],
+            mode="lines", fill="tozeroy",
+            line=dict(color="#8E44AD", width=2.5, shape="spline", smoothing=0.8),
+            fillcolor="rgba(142,68,173,0.15)",
+            name="E–W density",
+            hovertemplate="%{x:.1f} km from center<br>Density: %{y:.3f}<extra></extra>",
+        ), row=1, col=2)
+
+    for col in [1, 2]:
+        fig.add_vline(
+            x=0, line_dash="dot", line_color="rgba(231,76,60,0.7)",
+            line_width=1.5, row=1, col=col,
+        )
+        fig.add_annotation(
+            x=0, y=1.05, xref=f"x{col if col > 1 else ''}",
+            yref="paper", text="Center",
+            showarrow=False, font=dict(size=9, color="#E74C3C"),
+            row=1, col=col,
+        )
+
+    fig.update_xaxes(title_text="km from city center", zeroline=True,
+                     zerolinecolor="rgba(200,200,200,0.3)")
+    fig.update_yaxes(title_text="Floor Volume Ratio", row=1, col=1)
+
     fig.update_layout(
-        title="Urban Density Gradient from City Center",
-        xaxis_title="Distance from Center (km)", yaxis_title="Mean Building Height (m)",
-        template="plotly_white", height=400,
+        title="Urban Density Cross-Sections: N↔S and W↔E",
+        template="plotly_white",
+        height=400,
+        showlegend=False,
+        margin=dict(l=10, r=10, t=70, b=40),
         font=_FONT, title_font=_TITLE_FONT,
-        **layout_kw,
     )
     return fig
 
@@ -1470,6 +1578,17 @@ def chart_district_scorecard(scores_df: pd.DataFrame) -> go.Figure:
         scores_df = scores_df.copy()
         scores_df["_sort_key"] = scores_df["overall_grade"].map(_grade_order).fillna(4)
         scores_df = scores_df.sort_values("_sort_key").drop(columns=["_sort_key"])
+
+    city_row = {'district_name': '🏙️ CITY OVERALL'}
+    for col in grade_cols:
+        score_col = col.replace('_grade', '_score')
+        if score_col in scores_df.columns:
+            mean_score = scores_df[score_col].mean()
+            city_row[col] = ('A' if mean_score >= 0.65 else 'B' if mean_score >= 0.45
+                             else 'C' if mean_score >= 0.25 else 'D')
+    city_df = pd.DataFrame([city_row])
+    scores_df = pd.concat([city_df, scores_df], ignore_index=True)
+
     z_text, z_colors = [], []
     for _, row in scores_df.iterrows():
         row_text, row_colors = [], []
@@ -1495,7 +1614,7 @@ def chart_district_scorecard(scores_df: pd.DataFrame) -> go.Figure:
     fig.update_layout(
         title='District Scorecard',
         title_subtitle_text='Sorted by overall performance',
-        height=max(300, len(scores_df) * 40 + 100),
+        height=max(250, len(scores_df) * 30 + 80),
         template='plotly_white',
         xaxis=dict(side='top'),
         margin=dict(l=150, r=20, t=80, b=20),
@@ -1506,14 +1625,21 @@ def chart_district_scorecard(scores_df: pd.DataFrame) -> go.Figure:
 
 # ── New charts (Part 4) ───────────────────────────────────────────────────────
 
+def _latlng_to_cell(lat, lon, resolution):
+    try:
+        return h3.geo_to_h3(lat, lon, resolution)
+    except AttributeError:
+        return h3.latlng_to_cell(lat, lon, resolution)
+
+
 def chart_poi_density_contour(poi_df, city_polygon=None) -> go.Figure:
+    """POI density as H3 hex heatmap — readable at all zoom levels"""
     if poi_df is None or poi_df.empty:
-        return _empty("No POI data for density contour")
+        return _empty("No POI data for density map")
     if "lat" not in poi_df.columns or "lon" not in poi_df.columns:
         return _empty("POI data missing lat/lon columns")
-    df = poi_df.dropna(subset=["lat", "lon"])
-    if len(df) < 10:
-        return _empty("Insufficient POI data for density contour")
+
+    df = poi_df.dropna(subset=["lat", "lon"]).copy()
     if city_polygon is not None:
         try:
             from shapely.geometry import Point
@@ -1522,35 +1648,33 @@ def chart_poi_density_contour(poi_df, city_polygon=None) -> go.Figure:
         except Exception:
             pass
     if len(df) < 10:
-        return _empty("Insufficient POIs within city boundary")
-    center_lat = float(df["lat"].mean())
-    center_lon = float(df["lon"].mean())
-    try:
-        from scipy.stats import gaussian_kde
-        coords = np.vstack([df["lon"].values, df["lat"].values])
-        kde = gaussian_kde(coords, bw_method=0.05)
-        lon_range = np.linspace(df["lon"].min(), df["lon"].max(), 80)
-        lat_range = np.linspace(df["lat"].min(), df["lat"].max(), 80)
-        lon_grid, lat_grid = np.meshgrid(lon_range, lat_range)
-        z = kde(np.vstack([lon_grid.ravel(), lat_grid.ravel()])).reshape(lon_grid.shape)
-        fig = go.Figure(go.Densitymap(
-            lat=lat_grid.ravel(), lon=lon_grid.ravel(), z=z.ravel(),
-            radius=15, colorscale="YlOrRd", showscale=True,
-            colorbar=dict(title="POI Density"),
-            opacity=0.65,
-        ))
-    except Exception:
-        fig = go.Figure(go.Densitymap(
-            lat=df["lat"], lon=df["lon"], z=[1] * len(df),
-            radius=20, colorscale="YlOrRd", showscale=False, opacity=0.65,
-        ))
-    zoom_val = compute_zoom_level(gpd.GeoDataFrame(
-        geometry=gpd.points_from_xy(df["lon"], df["lat"]), crs="EPSG:4326"))
+        return _empty("Insufficient POI data for density map")
+
+    df["h3_cell"] = df.apply(
+        lambda r: _latlng_to_cell(float(r["lat"]), float(r["lon"]), 8), axis=1
+    )
+
+    density = df.groupby("h3_cell").size().reset_index(name="poi_count")
+    density["lat"] = density["h3_cell"].apply(lambda c: h3.cell_to_latlng(c)[0])
+    density["lon"] = density["h3_cell"].apply(lambda c: h3.cell_to_latlng(c)[1])
+
+    density["poi_count_log"] = np.log1p(density["poi_count"])
+
+    fig = _choropleth_hex(
+        density, "poi_count_log", "POI Activity Density (log scale)",
+        colorscale=[[0, "rgba(255,255,212,0.3)"], [0.4, "#feb24c"],
+                    [0.7, "#f03b20"], [1.0, "#bd0026"]],
+        hover_cols=["poi_count"],
+        mapbox_style="carto-positron",
+        height=500,
+        city_polygon=city_polygon,
+    )
     fig.update_layout(
-        title="POI Density Distribution",
-        map=dict(style="carto-positron", center=dict(lat=center_lat, lon=center_lon), zoom=zoom_val),
-        template="plotly_white", height=500, margin=dict(l=0, r=0, t=50, b=0),
-        font=_FONT, title_font=_TITLE_FONT,
+        coloraxis_colorbar=dict(
+            title="POI Count",
+            tickvals=[np.log1p(v) for v in [1, 5, 20, 50, 100, 200]],
+            ticktext=["1", "5", "20", "50", "100", "200+"],
+        )
     )
     return fig
 
@@ -1604,31 +1728,44 @@ def chart_morphological_transition(merged_hex_gdf, city_center_lat: float,
 
 
 def chart_urban_efficiency_pareto(stress_gdf, admin_boundaries=None) -> go.Figure:
-    if stress_gdf is None or stress_gdf.empty or "urban_stress" not in stress_gdf.columns:
+    if stress_gdf is None or stress_gdf.empty:
         return _empty("No stress data for efficiency Pareto")
-    comp_cols = {
-        "density_stress": "Density",
-        "green_deficit": "Green Deficit",
-        "transit_deficit": "Transit Deficit",
-        "flood_stress": "Flood",
-        "mono_stress": "Mono-Function",
-    }
-    available = {k: v for k, v in comp_cols.items() if k in stress_gdf.columns}
-    if not available:
-        return _empty("No stress component columns for Pareto chart")
-    means = {v: float(stress_gdf[k].mean()) for k, v in available.items()}
-    labels = sorted(means, key=means.get, reverse=True)
-    values = [means[l] for l in labels]
-    cumulative = np.cumsum(values) / sum(values) * 100
-    _bar_colors = ["#E74C3C" if v > 0.6 else "#F39C12" if v > 0.3 else "#27AE60" for v in values]
+    if "h3_cell" not in stress_gdf.columns or "urban_stress" not in stress_gdf.columns:
+        return _empty("Need h3_cell and urban_stress columns for Pareto analysis")
+
+    df = stress_gdf[["h3_cell", "urban_stress"]].copy()
+    df["urban_stress"] = pd.to_numeric(df["urban_stress"], errors="coerce")
+    df = df.dropna(subset=["urban_stress"])
+    df = df[df["urban_stress"] > 0]
+
+    if len(df) < 10:
+        return _empty("Insufficient stress data for Pareto analysis (need 10+ hex cells)")
+
+    df["pct_rank"] = df["urban_stress"].rank(ascending=False) / len(df) * 100
+    df["bucket"] = pd.cut(df["pct_rank"], bins=20, labels=False) * 5
+    bucket_stress = df.groupby("bucket", observed=True)["urban_stress"].mean().reset_index()
+    bucket_stress = bucket_stress.dropna().sort_values("bucket")
+
+    if bucket_stress.empty:
+        return _empty("Insufficient stress data for Pareto analysis")
+
+    bucket_stress["bucket_label"] = bucket_stress["bucket"].apply(
+        lambda b: f"Top {int(b)}-{int(b) + 5}%"
+    )
+    total = bucket_stress["urban_stress"].sum()
+    bucket_stress["cumulative_pct"] = bucket_stress["urban_stress"].cumsum() / total * 100
+
+    _bar_colors = ["#E74C3C" if v > 0.6 else "#F39C12" if v > 0.3 else "#27AE60"
+                   for v in bucket_stress["urban_stress"]]
+
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Bar(
-        x=labels, y=values, marker_color=_bar_colors,
-        name="Mean Stress Component",
+        x=bucket_stress["bucket_label"], y=bucket_stress["urban_stress"],
+        marker_color=_bar_colors, name="Mean Urban Stress",
     ), secondary_y=False)
     fig.add_trace(go.Scatter(
-        x=labels, y=cumulative, mode="lines+markers",
-        line=dict(color="#2C3E50", width=2), marker=dict(size=7),
+        x=bucket_stress["bucket_label"], y=bucket_stress["cumulative_pct"],
+        mode="lines+markers", line=dict(color="#2C3E50", width=2), marker=dict(size=7),
         name="Cumulative %",
     ), secondary_y=True)
     fig.add_hline(y=80, line_dash="dot", line_color="gray", opacity=0.6, secondary_y=True,
@@ -1639,59 +1776,92 @@ def chart_urban_efficiency_pareto(stress_gdf, admin_boundaries=None) -> go.Figur
         legend=dict(orientation="h", yanchor="bottom", y=1.02),
         font=_FONT, title_font=_TITLE_FONT,
     )
-    fig.update_yaxes(title_text="Mean Component Score", secondary_y=False)
-    fig.update_yaxes(title_text="Cumulative %", secondary_y=True, range=[0, 110])
+    fig.update_xaxes(title_text="Hex cells ranked by stress (percentile bands, highest first)")
+    fig.update_yaxes(title_text="Mean Urban Stress", secondary_y=False)
+    fig.update_yaxes(title_text="Cumulative % of total stress", secondary_y=True, range=[0, 110])
     return fig
 
 
-def chart_accessibility_spider(poi_df, city_center_lat: float,
-                                city_center_lon: float) -> go.Figure:
+def chart_nearest_services(poi_df, city_center_lat: float, city_center_lon: float) -> go.Figure:
+    """Top nearest services to city center — horizontal bar chart"""
     if poi_df is None or poi_df.empty:
-        return _empty("No POI data for accessibility spider")
+        return _empty("No POI data for nearest services")
     if "lat" not in poi_df.columns or "lon" not in poi_df.columns:
         return _empty("POI data missing lat/lon columns")
-    _services = {
-        "Food & Drink":   ["food_and_beverage", "restaurant", "cafe", "bakery", "bar"],
-        "Healthcare":     ["health_and_medical", "hospital", "pharmacy", "clinic"],
-        "Education":      ["education", "school", "university", "kindergarten"],
-        "Retail":         ["retail", "shop", "market", "supermarket"],
-        "Recreation":     ["entertainment", "leisure", "sport", "gym", "park"],
-        "Finance":        ["financial_service", "bank", "atm"],
+    if "category" not in poi_df.columns:
+        return _empty("POI data missing category column")
+
+    from scipy.spatial import cKDTree
+
+    SERVICE_TYPES = {
+        "Hospital / Clinic":   ["hospital", "clinic", "doctor", "medical", "health"],
+        "Park / Green Space":  ["park", "garden", "recreation", "leisure"],
+        "Public Transit Stop": ["train_station", "bus_station", "transportation"],
+        "Supermarket":         ["supermarket", "grocery", "market"],
+        "School / University": ["school", "university", "college", "education"],
+        "Pharmacy":            ["pharmacy", "drug_store"],
+        "Restaurant":          ["restaurant", "cafe", "bistro", "french_restaurant"],
+        "Bank / ATM":          ["bank", "banks", "atm", "financial"],
     }
+
     try:
         center_gdf = gpd.GeoDataFrame(
             geometry=gpd.points_from_xy([city_center_lon], [city_center_lat]), crs="EPSG:4326"
         ).to_crs("EPSG:3857")
-        center_pt = center_gdf.geometry[0]
-        poi_gdf = gpd.GeoDataFrame(
-            geometry=gpd.points_from_xy(poi_df["lon"], poi_df["lat"]), crs="EPSG:4326"
+        cx, cy = center_gdf.geometry.x.iloc[0], center_gdf.geometry.y.iloc[0]
+
+        poi_proj = gpd.GeoDataFrame(
+            poi_df.copy(),
+            geometry=gpd.points_from_xy(poi_df["lon"], poi_df["lat"]),
+            crs="EPSG:4326",
         ).to_crs("EPSG:3857")
     except Exception:
-        return _empty("Coordinate projection failed for accessibility spider")
-    scores = {}
-    for label, kws in _services.items():
-        if "category" in poi_df.columns:
-            mask = poi_df["category"].fillna("").str.lower().apply(lambda c: any(k in c for k in kws))
-        else:
-            mask = pd.Series(False, index=poi_df.index)
-        sub_idx = poi_df[mask].index
-        if len(sub_idx) == 0:
-            scores[label] = 0.0
+        return _empty("Coordinate projection failed for nearest services")
+
+    results = []
+    for service_label, keywords in SERVICE_TYPES.items():
+        mask = poi_df["category"].fillna("").str.lower().apply(
+            lambda c: any(k in c for k in keywords)
+        )
+        sub = poi_proj[mask.values]
+        if sub.empty:
+            results.append({"service": service_label, "distance_km": None})
             continue
-        dists = poi_gdf.geometry.iloc[sub_idx].distance(center_pt)
-        med_dist = float(dists.median())
-        scores[label] = max(0.0, 1.0 - med_dist / 5000)
-    labels = list(scores.keys())
-    values = [scores[l] for l in labels]
-    fig = go.Figure(go.Scatterpolar(
-        r=values + [values[0]], theta=labels + [labels[0]],
-        fill="toself", fillcolor="rgba(52,152,219,0.25)",
-        line=dict(color="#2980B9", width=2),
+        pts = np.array(list(zip(sub.geometry.x, sub.geometry.y)))
+        tree = cKDTree(pts)
+        dist, _ = tree.query([[cx, cy]])
+        results.append({
+            "service": service_label,
+            "distance_km": round(float(dist[0]) / 1000, 2),
+        })
+
+    df_res = pd.DataFrame(results).dropna()
+    if df_res.empty:
+        return _empty("No services found near city center")
+
+    df_res = df_res.sort_values("distance_km")
+    colors = ["#27AE60" if d < 0.5 else "#F39C12" if d < 1.5 else "#E74C3C"
+              for d in df_res["distance_km"]]
+
+    fig = go.Figure(go.Bar(
+        x=df_res["distance_km"],
+        y=df_res["service"],
+        orientation="h",
+        marker_color=colors,
+        text=[f"{d:.2f} km" for d in df_res["distance_km"]],
+        textposition="outside",
     ))
+    fig.add_vline(x=0.5, line_dash="dot", line_color="#27AE60",
+                  annotation_text="5 min walk")
+    fig.add_vline(x=1.5, line_dash="dot", line_color="#F39C12",
+                  annotation_text="15 min walk")
     fig.update_layout(
-        title="Service Accessibility from City Center",
-        polar=dict(radialaxis=dict(visible=True, range=[0, 1])),
-        template="plotly_white", height=420, showlegend=False,
+        title="Distance from City Center to Nearest Services",
+        xaxis_title="Distance (km)",
+        xaxis=dict(range=[0, max(df_res["distance_km"].max() * 1.2, 3)]),
+        template="plotly_white",
+        height=400,
+        margin=dict(l=10, r=80, t=50, b=40),
         font=_FONT, title_font=_TITLE_FONT,
     )
     return fig

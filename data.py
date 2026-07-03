@@ -199,14 +199,13 @@ def fetch_transport_data(city_name: str, bbox=None) -> dict:
         "roads": gpd.GeoDataFrame(),
         "transit_stops": gpd.GeoDataFrame(),
         "cycling": gpd.GeoDataFrame(),
-        "parking": gpd.GeoDataFrame(),
     }
 
-    # Roads
+    # Roads — major roads only; minor roads (residential/service/footway/etc.)
+    # add ~80% of data volume but contribute little to the analytics
     try:
         roads = _osm_features(city_name, bbox,
-                              {"highway": ["motorway", "primary", "secondary", "tertiary",
-                                           "residential", "cycleway", "footway", "trunk"]})
+                              {"highway": ["motorway", "trunk", "primary", "secondary", "tertiary"]})
         roads = roads[roads.geometry.geom_type.isin(["LineString", "MultiLineString"])].copy()
         if "highway" not in roads.columns:
             roads["highway"] = "other"
@@ -254,13 +253,6 @@ def fetch_transport_data(city_name: str, bbox=None) -> dict:
         result["cycling"] = gpd.GeoDataFrame(
             pd.concat(cycling_gdfs, ignore_index=True), crs="EPSG:4326"
         )
-
-    try:
-        parking = _osm_features(city_name, bbox, {"amenity": "parking"})
-        if not parking.empty:
-            result["parking"] = parking[["geometry"]].copy()
-    except Exception as e:
-        print(f"[transport] Parking error: {e}")
 
     return result
 
@@ -409,8 +401,8 @@ def fetch_terrain_data(city_name: str, bbox: tuple) -> dict:
         return {"elevation_grid": None}
 
     min_lon, min_lat, max_lon, max_lat = bbox
-    lat_steps = np.linspace(min_lat, max_lat, 30)
-    lon_steps = np.linspace(min_lon, max_lon, 30)
+    lat_steps = np.linspace(min_lat, max_lat, 20)
+    lon_steps = np.linspace(min_lon, max_lon, 20)
     grid_lats, grid_lons = np.meshgrid(lat_steps, lon_steps)
     grid_lats = grid_lats.flatten()
     grid_lons = grid_lons.flatten()

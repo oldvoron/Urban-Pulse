@@ -3,7 +3,28 @@ import numpy as np
 import geopandas as gpd
 import h3
 import osmnx as ox
+import unicodedata
 from math import log2
+
+
+def normalize_district_name(name):
+    """Transliterate non-Latin names, keep original in brackets"""
+    if name is None:
+        return "Unknown"
+    name = str(name).strip()
+    has_non_latin = any(ord(c) > 127 for c in name if c.isalpha())
+    if not has_non_latin:
+        return name.title()
+    try:
+        transliterated = unicodedata.normalize('NFKD', name)
+        transliterated = ''.join(c for c in transliterated if ord(c) < 128)
+        transliterated = transliterated.strip().title()
+        if transliterated and transliterated != name:
+            return f"{transliterated} ({name})"
+        else:
+            return name
+    except Exception:
+        return name
 
 
 def poi_category_distribution(poi_df: pd.DataFrame) -> pd.Series:
@@ -211,7 +232,9 @@ def street_network_stats(graph) -> dict:
         return {}
 
 
-def compute_morphological_index(buildings_gdf: gpd.GeoDataFrame, graph) -> dict:
+def compute_morphological_index(buildings_gdf: gpd.GeoDataFrame, graph,
+                                 poi_hex: pd.DataFrame = None,
+                                 diversity_df: pd.DataFrame = None) -> dict:
     empty_result = {
         "typologies": pd.Series(dtype=str),
         "typology_counts": pd.Series(dtype=int),
@@ -279,8 +302,38 @@ def compute_morphological_index(buildings_gdf: gpd.GeoDataFrame, graph) -> dict:
         lambda r: h3.latlng_to_cell(r["lat"], r["lon"], 9), axis=1
     )
 
-    # Estimate floors from height
-    buildings_m["floors"] = (buildings_m["height_num"] / 3.5).clip(lower=1.0)
+    # Floor count estimation with multiple per-building fallbacks
+    # (height_num alone collapses to 1 floor everywhere when height data is absent)
+    def estimate_floors(row):
+        if pd.notna(row.get("height")):
+            try:
+                h = float(str(row["height"]).replace("m", "").strip())
+                if 0 < h < 300:
+                    return max(1.0, h / 3.5)
+            except Exception:
+                pass
+        for col in ("building:levels", "levels"):
+            if pd.notna(row.get(col)):
+                try:
+                    lvl = float(row[col])
+                    if 0 < lvl < 100:
+                        return lvl
+                except Exception:
+                    pass
+        btype = str(row.get("building", "")).lower()
+        if btype in ("apartments", "residential", "house"):
+            return 3.0
+        elif btype in ("commercial", "office", "retail"):
+            return 4.0
+        elif btype in ("industrial", "warehouse", "garage"):
+            return 1.5
+        elif btype in ("cathedral", "church", "mosque"):
+            return 2.0
+        else:
+            return 2.5  # global urban average
+
+    buildings_m["floors"] = buildings_m.apply(estimate_floors, axis=1)
+    buildings_m["floor_area"] = buildings_m["footprint_area"] * buildings_m["floors"]
 
     # H3 resolution 9 average area in m²
     try:
@@ -293,18 +346,21 @@ def compute_morphological_index(buildings_gdf: gpd.GeoDataFrame, graph) -> dict:
 
     grp = buildings_m.groupby("h3_cell")
 
-    hex_far = grp.apply(
-        lambda g: (g["footprint_area"] * g["floors"]).sum() / hex_area_m2
+    hex_far = grp.agg(
+        total_floor_area=("floor_area", "sum"),
+        total_footprint=("footprint_area", "sum"),
+        median_floors=("floors", "median"),
     ).reset_index()
-    hex_far.columns = ["h3_cell", "FAR"]
+    hex_far["FAR"] = hex_far["total_floor_area"] / hex_area_m2
+    hex_far["BCR"] = (hex_far["total_footprint"] / hex_area_m2).clip(0, 1)
+    hex_far["median_height"] = hex_far["median_floors"] * 3.5
 
-    hex_bcr = grp.apply(
-        lambda g: g["footprint_area"].sum() / hex_area_m2
-    ).reset_index()
-    hex_bcr.columns = ["h3_cell", "BCR"]
+    print(f"[FAR] range: {hex_far['FAR'].min():.3f} - {hex_far['FAR'].max():.3f}, "
+          f"mean: {hex_far['FAR'].mean():.3f}")
 
-    hex_height = grp["height_num"].median().reset_index()
-    hex_height.columns = ["h3_cell", "median_height"]
+    hex_bcr = hex_far[["h3_cell", "BCR"]].copy()
+    hex_height = hex_far[["h3_cell", "median_height"]].copy()
+    hex_far = hex_far[["h3_cell", "FAR"]]
 
     # Street density per hex cell
     street_density_map = {}
@@ -340,29 +396,62 @@ def compute_morphological_index(buildings_gdf: gpd.GeoDataFrame, graph) -> dict:
         + 0.3 * hex_metrics["BCR_norm"]
     )
 
-    # KMeans morphotype clustering
-    _label_order = ["dense_urban", "historic_core", "mixed_mid", "industrial", "suburban"]
-    features_cols = ["FAR", "BCR", "median_height", "street_density"]
-    features = hex_metrics[features_cols].fillna(0.0)
+    # KMeans morphotype clustering — 6 features so the catch-all cluster
+    # doesn't lump parks, parking lots and warehouses together as "industrial"
+    hex_metrics["street_density_norm"] = _minmax(hex_metrics["street_density"])
+
+    poi_count_col = None
+    if poi_hex is not None and not poi_hex.empty and "h3_cell" in poi_hex.columns:
+        poi_count_col = next((c for c in ("poi_count", "count") if c in poi_hex.columns), None)
+    if poi_count_col:
+        poi_counts = poi_hex.set_index("h3_cell")[poi_count_col]
+        hex_metrics["poi_density_norm"] = _minmax(
+            hex_metrics["h3_cell"].map(poi_counts).fillna(0.0)
+        )
+    else:
+        hex_metrics["poi_density_norm"] = 0.3
+
+    if (diversity_df is not None and not diversity_df.empty
+            and "h3_cell" in diversity_df.columns and "diversity_score" in diversity_df.columns):
+        div_map = diversity_df.set_index("h3_cell")["diversity_score"]
+        mapped_div = hex_metrics["h3_cell"].map(div_map)
+        hex_metrics["diversity_norm"] = _minmax(mapped_div.fillna(mapped_div.mean()))
+    else:
+        hex_metrics["diversity_norm"] = 0.3
+
+    feature_cols = ["FAR_norm", "BCR_norm", "height_norm",
+                    "street_density_norm", "poi_density_norm", "diversity_norm"]
+    features = hex_metrics[feature_cols].fillna(0.5)
 
     if len(features) >= 5:
         try:
             from sklearn.cluster import KMeans
             kmeans = KMeans(n_clusters=5, random_state=42, n_init=10)
-            cluster_ids = kmeans.fit_predict(features)
-            hex_metrics["_cluster_id"] = cluster_ids
+            hex_metrics["cluster_raw"] = kmeans.fit_predict(features)
 
-            # Sort clusters by mean FAR descending → assign labels
-            cluster_far_mean = (
-                hex_metrics.groupby("_cluster_id")["FAR"].mean()
-                .sort_values(ascending=False)
-            )
-            remap = {
-                int(old_id): _label_order[rank]
-                for rank, old_id in enumerate(cluster_far_mean.index)
-            }
-            hex_metrics["cluster"] = hex_metrics["_cluster_id"].map(remap)
-            hex_metrics = hex_metrics.drop(columns=["_cluster_id"])
+            # Label clusters by their actual characteristics, not a fixed rank order
+            cluster_profiles = hex_metrics.groupby("cluster_raw")[feature_cols].mean()
+            far_order = cluster_profiles["FAR_norm"].sort_values(ascending=False).index.tolist()
+
+            labels = {far_order[0]: "dense_urban"}
+            for cluster_id in far_order:
+                if cluster_id in labels:
+                    continue
+                far_val = cluster_profiles.loc[cluster_id, "FAR_norm"]
+                div_val = cluster_profiles.loc[cluster_id, "diversity_norm"]
+                bcr_val = cluster_profiles.loc[cluster_id, "BCR_norm"]
+                h_val = cluster_profiles.loc[cluster_id, "height_norm"]
+                if div_val > 0.5 and far_val > 0.3:
+                    labels[cluster_id] = "historic_core"
+                elif far_val < 0.2 and bcr_val < 0.2:
+                    labels[cluster_id] = "suburban"
+                elif bcr_val > 0.4 and h_val < 0.3:
+                    labels[cluster_id] = "low_rise_commercial"
+                else:
+                    labels[cluster_id] = "residential"
+
+            hex_metrics["cluster"] = hex_metrics["cluster_raw"].map(labels)
+            hex_metrics = hex_metrics.drop(columns=["cluster_raw"])
         except Exception as e:
             print(f"[compute_morphological_index] KMeans error: {e}")
             hex_metrics["cluster"] = "suburban"
@@ -1195,21 +1284,27 @@ def compute_district_scores(merged_hex_gdf: gpd.GeoDataFrame, admin_boundaries: 
         hex_points['geometry'] = gpd.points_from_xy(hex_points['lon'], hex_points['lat'])
         hex_points = gpd.GeoDataFrame(hex_points, crs='EPSG:4326')
 
+        gdf = gdf.copy()
+        gdf['admin_name'] = gdf['admin_name'].apply(normalize_district_name)
+
         try:
             joined = gpd.sjoin(hex_points, gdf[['admin_name', 'geometry']], how='left', predicate='within')
         except Exception:
             continue
 
         def score_to_grade(score, higher_is_better=True):
+            if pd.isna(score):
+                return 'N/A'
             if not higher_is_better:
                 score = 1 - score
-            if score >= 0.75:
+            if score >= 0.65:
                 return 'A'
-            elif score >= 0.55:
+            elif score >= 0.45:
                 return 'B'
-            elif score >= 0.35:
+            elif score >= 0.25:
                 return 'C'
-            return 'D'
+            else:
+                return 'D'
 
         for district in joined['admin_name'].dropna().unique():
             district_hexes = joined[joined['admin_name'] == district]

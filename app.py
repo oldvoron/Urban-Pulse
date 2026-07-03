@@ -1,4 +1,5 @@
 import os
+import concurrent.futures
 import streamlit as st
 import pandas as pd
 import geopandas as gpd
@@ -73,7 +74,7 @@ from charts import (
     chart_poi_density_contour,
     chart_morphological_transition,
     chart_urban_efficiency_pareto,
-    chart_accessibility_spider,
+    chart_nearest_services,
     chart_poi_dominance_map,
     chart_street_centrality_edges,
 )
@@ -257,7 +258,7 @@ st.title("UrbanPulse — Urban Spatial Analytics")
 
 with st.sidebar:
     st.header("Settings")
-    city_name = st.text_input("City", value="Tours, France")
+    city_name = st.text_input("City", value="", placeholder="e.g. Lyon, France")
     analyze = st.button("Analyze", type="primary", use_container_width=True)
     st.markdown("---")
 
@@ -328,6 +329,10 @@ with st.sidebar:
     st.caption("Data: Overture Maps + OpenStreetMap")
     st.caption("AI: Claude Sonnet")
 
+if not city_name.strip():
+    st.info("Enter a city name in the sidebar to begin analysis.")
+    st.stop()
+
 
 # ── Cache wrappers ────────────────────────────────────────────────────────────
 
@@ -367,17 +372,22 @@ if analyze:
     st.session_state["analysis_done"] = False
     st.session_state['_last_zone'] = _curr_zone
 
-    # Step 1: Admin boundaries + city polygon
+    # Step 1: Admin boundaries + city polygon (cached — skip refetch for the same city)
     with st.spinner("Fetching administrative boundaries…"):
-        try:
-            admin_boundaries = load_admin_boundaries(city_name)
+        if (st.session_state.get('admin_boundaries') is not None
+                and st.session_state.get('last_city') == city_name):
+            admin_boundaries = st.session_state['admin_boundaries']
+        else:
+            try:
+                admin_boundaries = load_admin_boundaries(city_name)
+            except Exception as e:
+                st.warning(f"Admin boundaries failed: {e}")
+                admin_boundaries = {}
             st.session_state['admin_boundaries'] = admin_boundaries
-            if not admin_boundaries.get('has_districts', False):
-                st.info("No sub-city districts found — showing city boundary only.")
-        except Exception as e:
-            st.warning(f"Admin boundaries failed: {e}")
-            admin_boundaries = {}
-            st.session_state['admin_boundaries'] = {}
+            st.session_state['last_city'] = city_name
+
+        if not admin_boundaries.get('has_districts', False):
+            st.info("No sub-city districts found — showing city boundary only.")
 
     city_polygon = get_city_polygon(admin_boundaries)
     st.session_state['city_polygon'] = city_polygon
@@ -390,6 +400,36 @@ if analyze:
     # Step 2: Fetch data
     status = st.empty()
 
+    status.text("Fetching OSM street network, land use & nature data in parallel…")
+    osm_result   = {"graph": None, "buildings": None}
+    landuse_gdf  = gpd.GeoDataFrame()
+    nature_data  = {"green_spaces": gpd.GeoDataFrame(), "water_bodies": gpd.GeoDataFrame(),
+                    "flood_risk_proxy": gpd.GeoDataFrame()}
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+        future_osm = (executor.submit(load_osm, city_name, analysis_bbox)
+                      if (run_morphology or run_transport) else None)
+        future_landuse = executor.submit(load_landuse, city_name, analysis_bbox)
+        future_nature = (executor.submit(load_nature, city_name, analysis_bbox)
+                         if run_nature else None)
+
+        if future_osm is not None:
+            try:
+                osm_result = future_osm.result()
+            except Exception as e:
+                st.warning(f"OSM fetch failed: {e}")
+
+        try:
+            landuse_gdf = future_landuse.result()
+        except Exception as e:
+            st.warning(f"Land use fetch failed: {e}")
+
+        if future_nature is not None:
+            try:
+                nature_data = future_nature.result()
+            except Exception as e:
+                st.warning(f"Nature data fetch failed: {e}")
+
     status.text("Fetching Overture Maps POIs…")
     poi_df = load_pois(city_name, bbox=analysis_bbox)
     poi_df = clip_to_city(poi_df, city_polygon)
@@ -400,8 +440,6 @@ if analyze:
     buildings_gdf = gpd.GeoDataFrame(columns=["geometry", "height"])
 
     if run_morphology or run_transport:
-        status.text("Fetching OSM street network & buildings…")
-        osm_result = load_osm(city_name, bbox=analysis_bbox)
         graph = osm_result.get("graph")
         buildings_raw = osm_result.get("buildings")
 
@@ -424,8 +462,6 @@ if analyze:
         n_bld   = len(buildings_gdf)
         status.text(f"✅ OSM: {n_nodes:,} street nodes, {n_bld:,} buildings")
 
-    status.text("Fetching OSM land use…")
-    landuse_gdf = load_landuse(city_name, bbox=analysis_bbox)
     landuse_gdf = clip_to_city(landuse_gdf, city_polygon)
     status.text(f"✅ Land use: {len(landuse_gdf):,} polygons")
 
@@ -440,11 +476,9 @@ if analyze:
         status.text(f"✅ Transport: {n_stops:,} transit stops")
     else:
         transport_data = {"roads": gpd.GeoDataFrame(), "transit_stops": gpd.GeoDataFrame(),
-                          "cycling": gpd.GeoDataFrame(), "parking": gpd.GeoDataFrame()}
+                          "cycling": gpd.GeoDataFrame()}
 
     if run_nature:
-        status.text("Fetching nature & green space data…")
-        nature_data = load_nature(city_name, bbox=analysis_bbox)
         nature_data["green_spaces"] = clip_to_city(
             nature_data.get("green_spaces", gpd.GeoDataFrame()), city_polygon)
         nature_data["water_bodies"] = clip_to_city(
@@ -456,6 +490,14 @@ if analyze:
                        "flood_risk_proxy": gpd.GeoDataFrame()}
 
     status.empty()
+
+    # Sample buildings for metric computation on very large cities — keeps full
+    # buildings_gdf intact for the height distribution chart and stats
+    if buildings_gdf is not None and len(buildings_gdf) > 50000:
+        buildings_sample = buildings_gdf.sample(50000, random_state=42)
+        print(f"[perf] Sampling 50000 from {len(buildings_gdf)} buildings for metrics")
+    else:
+        buildings_sample = buildings_gdf
 
     # Step 3: Core metrics
     with st.spinner("Computing core metrics…"):
@@ -485,7 +527,7 @@ if analyze:
 
         try:
             morph_data = (
-                compute_morphological_index(buildings_gdf, graph) if run_morphology
+                compute_morphological_index(buildings_sample, graph, diversity_df=diversity_df) if run_morphology
                 else {"hex_metrics": gpd.GeoDataFrame(),
                       "typology_counts": pd.Series(dtype=int),
                       "typologies": pd.Series(dtype=str)}
@@ -508,7 +550,7 @@ if analyze:
 
         try:
             transport_hex = (
-                transport_accessibility_index(buildings_gdf, transit_stops_gdf, graph)
+                transport_accessibility_index(buildings_sample, transit_stops_gdf, graph)
                 if run_transport else gpd.GeoDataFrame()
             )
         except Exception as e:
@@ -518,7 +560,7 @@ if analyze:
         try:
             nature_hex = (
                 nature_accessibility_index(
-                    buildings_gdf, green_spaces_gdf,
+                    buildings_sample, green_spaces_gdf,
                     nature_data.get("water_bodies", gpd.GeoDataFrame()),
                 )
                 if run_nature else gpd.GeoDataFrame()
@@ -770,19 +812,19 @@ if analyze:
                         st.session_state.get("city_polygon"),
                         key="t1_poi_contour", ss_key="poi_density_contour",
                         apply_admin_bounds=True)
-            st.caption("Kernel density estimation of POI concentration across the city, rendered as a continuous heat surface on the map. Source: Overture Maps Places. Uses Gaussian KDE with bandwidth 0.08° to smooth point data into a density field — warmer colours indicate higher concentrations of urban activity, revealing commercial cores and service clusters.")
+            st.caption("POI activity density shown as an H3 hex heatmap (resolution 8, log-scaled colour). Source: Overture Maps Places. Each cell is coloured by the number of POIs it contains — warmer colours (orange to dark red) indicate higher concentrations of urban activity, revealing commercial cores and service clusters that stay readable at every zoom level.")
 
         if has_data(poi_df, min_rows=5) and city_center_lat != 0.0:
-            _safe_chart(chart_accessibility_spider, poi_df, city_center_lat, city_center_lon,
-                        key="t1_accessibility_spider", ss_key="accessibility_spider")
-            st.caption("Radar chart showing the distance from the city centre to the nearest facility of each service type, normalised so that closer = higher score. Source: Overture Maps Places for commercial and civic services; OSM transit for public transport. Each axis label corresponds to the nearest POI in that category — raw distances in km shown on hover. Use to assess what is missing or distant from the urban core.")
+            _safe_chart(chart_nearest_services, poi_df, city_center_lat, city_center_lon,
+                        key="t1_nearest_services", ss_key="nearest_services")
+            st.caption("Distance from the city centre to the nearest facility of each service type, in kilometres. Green bars: within 5-minute walk (<0.5km); orange: within 15-minute walk (<1.5km); red: beyond walkable range. Source: Overture Maps Places. Computed using nearest-neighbour search from the city centroid.")
 
         _tab_export([
             ("poi_dominance_map",    "POI Dominance Map"),
             ("poi_distribution",     "POI Distribution"),
             ("landuse_composition",  "Land Use Composition"),
             ("poi_density_contour",  "POI Density Contour"),
-            ("accessibility_spider", "Accessibility Spider"),
+            ("nearest_services",     "Nearest Services"),
         ], "tab1")
 
     # ── Tab 2: Morphology ─────────────────────────────────────────────────────
@@ -798,13 +840,14 @@ if analyze:
             if has_data(hex_metrics, min_rows=1, required_cols=['cluster']):
                 _safe_chart(chart_morphotype_clusters, hex_metrics,
                             key="t2_clusters", ss_key="morphotype_clusters", apply_admin_bounds=True)
-                st.caption("Urban morphotype classification derived from KMeans clustering (k=5) applied to FAR, building coverage ratio, median height, and street density per H3 cell. Source: OSM buildings and OSMnx street network. Clusters are labelled by their dominant characteristics: historic_core (compact, mixed height), dense_urban (high FAR), mixed_mid (medium density), suburban (low FAR, large plots), industrial (large footprints, low height).")
+                st.caption("Urban morphotype classification derived from KMeans clustering (k=5) applied to six normalised features per H3 cell: floor-area ratio, building coverage ratio, median height, street density, POI density, and land-use diversity. Source: OSM buildings, OSMnx street network and Overture Maps POI. Clusters are labelled by their dominant profile: historic_core (high diversity, walkable mixed-use), dense_urban (highest FAR and height), residential (moderate FAR, low diversity), low_rise_commercial (high coverage, low height), suburban (low FAR and coverage, large plots).")
 
             if has_data(buildings_gdf, min_rows=5, required_cols=['height']):
-                _safe_chart(chart_density_gradient, buildings_gdf, city_center_lat, city_center_lon,
+                _safe_chart(chart_density_gradient, buildings_gdf,
                             poi_df=poi_df,
+                            city_center_lat=city_center_lat, city_center_lon=city_center_lon,
                             key="t2_density_grad", ss_key="density_gradient")
-                st.caption("Mean building height (left axis, blue) and POI density (right axis, orange) as a function of distance from the city centre, in 200m bands. Source: OSM buildings (height tag) and Overture Maps POI. The smoothed line uses a 3-band rolling average. A classic monocentric city shows declining height from centre; polycentric cities show multiple peaks. The POI gradient reveals where urban activity extends beyond the residential core.")
+                st.caption("Mean building height profiles along two perpendicular cross-sections through the city centre — north↔south (left, blue) and west↔east (right, purple) — in 0.3km bands, smoothed with a 3-band rolling average. Source: OSM buildings (height tag). The red dashed line marks the city centre. Compare the two profiles to spot directional asymmetries in the urban skyline — e.g. a taller core to the south or a denser corridor to the east.")
 
             if has_data(analysis_hex, min_rows=5) and city_center_lat != 0.0:
                 _safe_chart(chart_morphological_transition, analysis_hex,

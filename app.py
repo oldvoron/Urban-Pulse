@@ -493,9 +493,11 @@ if analyze:
         )
     gc.collect()
 
-    poi_df_raw = all_data.get('poi') or pd.DataFrame(columns=["name", "category", "lat", "lon"])
+    poi_raw = all_data.get('poi')
+    poi_df_raw = poi_raw if poi_raw is not None else pd.DataFrame(columns=["name", "category", "lat", "lon"])
     osm_result = all_data.get('osm') or {"graph": None, "buildings": None}
-    landuse_gdf = all_data.get('landuse') or gpd.GeoDataFrame()
+    landuse_raw = all_data.get('landuse')
+    landuse_gdf = landuse_raw if landuse_raw is not None else gpd.GeoDataFrame()
     transport_data = all_data.get('transport') or {
         "roads": gpd.GeoDataFrame(), "transit_stops": gpd.GeoDataFrame(), "cycling": gpd.GeoDataFrame()}
     nature_data = all_data.get('nature') or {

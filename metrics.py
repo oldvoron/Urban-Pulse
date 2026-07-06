@@ -367,7 +367,6 @@ def compute_morphological_index(buildings_gdf: gpd.GeoDataFrame, graph,
     if graph is not None:
         try:
             edges = ox.graph_to_gdfs(graph, nodes=False)
-            edges_wgs = edges.to_crs("EPSG:4326")
             edge_pts = edges.to_crs("EPSG:3857").geometry.centroid.to_crs("EPSG:4326")
             edge_h3 = edge_pts.apply(
                 lambda p: h3.latlng_to_cell(p.y, p.x, 9) if p is not None else None
@@ -640,7 +639,6 @@ def transport_accessibility_index(
             cyc_proj = edges_proj[cyc_mask.values].copy()
             if not cyc_proj.empty:
                 cyc_proj["length"] = cyc_proj.geometry.length
-                cyc_wgs = cyc_proj.to_crs("EPSG:4326")
                 cyc_h3 = cyc_proj.geometry.centroid.to_crs("EPSG:4326").apply(
                     lambda p: h3.latlng_to_cell(p.y, p.x, 9) if p else None
                 )

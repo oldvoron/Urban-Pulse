@@ -16,6 +16,7 @@ OVERPASS_MIRRORS = [
 def configure_osmnx():
     """Configure osmnx with retry-friendly settings."""
     ox.settings.timeout = 45
+    ox.settings.requests_timeout = 20
     ox.settings.max_query_area_size = 25_000_000_000
     ox.settings.overpass_rate_limit = False
     ox.settings.overpass_url = OVERPASS_MIRRORS[0]

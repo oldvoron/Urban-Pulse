@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from data import (
     fetch_overture_pois, fetch_osm_data, fetch_osm_landuse,
     fetch_transport_data, fetch_nature_data, fetch_terrain_data,
-    fetch_admin_boundaries, fetch_climate_data, fetch_population_grid,
+    fetch_admin_boundaries, fetch_climate_data,
     get_city_polygon,
 )
 from metrics import (
@@ -36,8 +36,6 @@ from metrics import (
 )
 from charts import (
     chart_poi_distribution,
-    chart_building_heights,
-    chart_diversity_heatmap,
     chart_street_network_radar,
     chart_morphotype_clusters,
     chart_far_heatmap,
@@ -82,12 +80,6 @@ from charts import (
 )
 
 load_dotenv()
-
-# Optional: streamlit-folium (for future drawing support)
-try:
-    import streamlit_folium  # noqa: F401
-except ImportError:
-    pass
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -200,7 +192,6 @@ def safe_merge(base, other, on: str = "h3_cell", how: str = "left"):
 
 def get_analysis_bbox(city_name, zone_mode, selected_district, admin_boundaries, custom_bbox):
     """Return (min_lon, min_lat, max_lon, max_lat) for the active zone selection."""
-    import osmnx as ox
     if zone_mode == "Draw custom bbox" and all(v != 0.0 for v in custom_bbox):
         return custom_bbox
     if zone_mode == "Select district" and selected_district != "All":
@@ -211,11 +202,13 @@ def get_analysis_bbox(city_name, zone_mode, selected_district, admin_boundaries,
                 if not match.empty:
                     b = match.total_bounds
                     return (b[0], b[1], b[2], b[3])
-    try:
-        bounds = ox.geocode_to_gdf(city_name).total_bounds
-        return (bounds[0], bounds[1], bounds[2], bounds[3])
-    except Exception:
-        return None
+    # Reuse the city boundary already fetched in fetch_admin_boundaries()
+    # instead of issuing a second, unprotected geocode request.
+    city_gdf = (admin_boundaries or {}).get("city")
+    if city_gdf is not None and not city_gdf.empty:
+        b = city_gdf.total_bounds
+        return (b[0], b[1], b[2], b[3])
+    return None
 
 
 def clip_to_city(data, city_polygon):

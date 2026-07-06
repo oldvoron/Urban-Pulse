@@ -151,6 +151,15 @@ def fetch_overture_pois(city_name: str, bbox=None, overture_limit: int = 15000) 
     except Exception as e:
         print(f"[overture] DuckDB S3 fallback failed: {e}")
 
+    # Fallback: OSM/Overpass via osmnx
+    try:
+        df = fetch_osm_pois(city_name, bbox=bbox)
+        if not df.empty:
+            print(f"[overture] OSM/Overpass fallback: {len(df)} places")
+            return df
+    except Exception as e:
+        print(f"[overture] OSM/Overpass fallback failed: {e}")
+
     return pd.DataFrame(columns=["name", "category", "lat", "lon"])
 
 
@@ -164,6 +173,42 @@ def _osm_features(city_name: str, bbox, tags: dict) -> gpd.GeoDataFrame:
     else:
         result = osmnx_fetch_with_retry(lambda: ox.features_from_place(city_name, tags=tags))
     return result if result is not None else gpd.GeoDataFrame()
+
+
+_POI_CATEGORY_TAGS = ["amenity", "shop", "tourism", "leisure", "office", "craft"]
+
+
+def fetch_osm_pois(city_name: str, bbox=None) -> pd.DataFrame:
+    """
+    Fetch POIs from OSM/Overpass (via osmnx, with mirror retry) as a fallback
+    for Overture Maps. Returns DataFrame with [name, category, lat, lon].
+    """
+    tags = {tag: True for tag in _POI_CATEGORY_TAGS}
+    gdf = _osm_features(city_name, bbox, tags)
+    if gdf.empty:
+        return pd.DataFrame(columns=["name", "category", "lat", "lon"])
+
+    df = gdf.copy()
+    if "name" in df.columns:
+        df["name"] = df["name"].fillna("")
+    else:
+        df["name"] = ""
+
+    def _category(row):
+        for tag in _POI_CATEGORY_TAGS:
+            val = row.get(tag)
+            if pd.notna(val) and val not in (None, "", False):
+                return val
+        return "unknown"
+
+    df["category"] = df.apply(_category, axis=1)
+
+    centroids = df.geometry.centroid
+    df["lat"] = centroids.y
+    df["lon"] = centroids.x
+
+    df = df.dropna(subset=["lat", "lon"])
+    return df[["name", "category", "lat", "lon"]].reset_index(drop=True)
 
 
 # ── Street network & buildings ────────────────────────────────────────────────

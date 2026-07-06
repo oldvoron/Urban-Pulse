@@ -2,4 +2,9 @@
 __pycache__/
 cache/
 cache/
+<<<<<<< HEAD
 __pycache__/
+=======
+>>>>>>> 832a21b478bd0a9bbdffbdf7fc760aba4278b057
+__pycache__/
+*.pyc

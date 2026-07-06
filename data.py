@@ -4,33 +4,55 @@ import geopandas as gpd
 import time
 
 
+OVERPASS_MIRRORS = [
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.openstreetmap.ru/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+    "https://lz4.overpass-api.de/api/interpreter",
+]
+
+
 def configure_osmnx():
     """Configure osmnx with retry-friendly settings."""
     ox.settings.timeout = 45
     ox.settings.max_query_area_size = 25_000_000_000
     ox.settings.overpass_rate_limit = False
-    ox.settings.overpass_url = "https://overpass-api.de/api/interpreter"
+    ox.settings.overpass_url = OVERPASS_MIRRORS[0]
 
 
 configure_osmnx()
 
 
 def osmnx_fetch_with_retry(fetch_func, max_retries=2, delay=3):
-    """Retry osmnx fetch with exponential backoff on connection errors (max ~9s total wait)."""
-    for attempt in range(max_retries):
-        try:
-            result = fetch_func()
-            time.sleep(2)
-            return result
-        except Exception as e:
-            err_str = str(e)
-            if any(k in err_str for k in ('Connection refused', 'Max retries', 'timeout', 'Timeout')):
-                if attempt < max_retries - 1:
-                    wait = delay * (attempt + 1)
-                    print(f"[OSM] Connection failed, retrying in {wait}s... (attempt {attempt+1}/{max_retries})")
-                    time.sleep(wait)
-                    continue
-            raise e
+    """
+    Retry osmnx fetch across Overpass mirrors (OVERPASS_MIRRORS) on connection
+    errors, backing off between attempts on the same mirror (max ~9s total wait
+    per mirror) before moving on to the next one.
+    """
+    last_exc = None
+    for mirror in OVERPASS_MIRRORS:
+        ox.settings.overpass_url = mirror
+        for attempt in range(max_retries):
+            try:
+                result = fetch_func()
+                time.sleep(2)
+                print(f"[OSM] Overpass mirror OK: {mirror}")
+                return result
+            except Exception as e:
+                last_exc = e
+                err_str = str(e)
+                if any(k in err_str for k in ('Connection refused', 'Max retries', 'timeout', 'Timeout')):
+                    if attempt < max_retries - 1:
+                        wait = delay * (attempt + 1)
+                        print(f"[OSM] {mirror} failed, retrying in {wait}s... (attempt {attempt+1}/{max_retries})")
+                        time.sleep(wait)
+                        continue
+                    print(f"[OSM] {mirror} failed after {max_retries} attempts, trying next mirror...")
+                    break
+                raise e
+    if last_exc is not None:
+        raise last_exc
     return None
 
 

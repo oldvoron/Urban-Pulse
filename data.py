@@ -2,6 +2,7 @@ import osmnx as ox
 import pandas as pd
 import geopandas as gpd
 import time
+import threading
 
 
 OVERPASS_MIRRORS = [
@@ -12,12 +13,23 @@ OVERPASS_MIRRORS = [
     "https://lz4.overpass-api.de/api/interpreter",
 ]
 
+# Caps how many Overpass HTTP calls the whole app can have in flight at once.
+# osmnx splits large bboxes into many internal sub-requests, and with 4 layers
+# (osm/transport/landuse/nature) fetched in parallel threads, uncapped
+# concurrency can flood public mirrors and take them down. Applies uniformly
+# to every osmnx_fetch_with_retry() call — admin boundaries, POIs (including
+# the OSM/Overpass POI fallback), street network, landuse, transport, nature.
+_OVERPASS_SEMAPHORE = threading.Semaphore(2)
+
 
 def configure_osmnx():
     """Configure osmnx with retry-friendly settings."""
     ox.settings.timeout = 45
     ox.settings.requests_timeout = 20
-    ox.settings.max_query_area_size = 25_000_000_000
+    # Smaller max query area => osmnx auto-splits bboxes into more, smaller
+    # sub-requests. Each sub-request is less likely to time out on its own,
+    # even though there are more of them overall.
+    ox.settings.max_query_area_size = 2_500_000_000
     ox.settings.overpass_rate_limit = False
     ox.settings.overpass_url = OVERPASS_MIRRORS[0]
 
@@ -25,18 +37,23 @@ def configure_osmnx():
 configure_osmnx()
 
 
-def osmnx_fetch_with_retry(fetch_func, max_retries=2, delay=3):
+def osmnx_fetch_with_retry(fetch_func, max_retries=1, delay=3):
     """
     Retry osmnx fetch across Overpass mirrors (OVERPASS_MIRRORS) on connection
-    errors, backing off between attempts on the same mirror (max ~9s total wait
-    per mirror) before moving on to the next one.
+    errors. On failure, moves straight to the next mirror rather than
+    retrying the same one — under load the problem is usually mirror
+    overload, not a one-off blip, so waiting and retrying in place just adds
+    latency without improving odds. Every actual HTTP call is gated by
+    _OVERPASS_SEMAPHORE so at most 2 Overpass requests are in flight across
+    the whole app at once.
     """
     last_exc = None
     for mirror in OVERPASS_MIRRORS:
         ox.settings.overpass_url = mirror
         for attempt in range(max_retries):
             try:
-                result = fetch_func()
+                with _OVERPASS_SEMAPHORE:
+                    result = fetch_func()
                 time.sleep(2)
                 print(f"[OSM] Overpass mirror OK: {mirror}")
                 return result
@@ -49,7 +66,7 @@ def osmnx_fetch_with_retry(fetch_func, max_retries=2, delay=3):
                         print(f"[OSM] {mirror} failed, retrying in {wait}s... (attempt {attempt+1}/{max_retries})")
                         time.sleep(wait)
                         continue
-                    print(f"[OSM] {mirror} failed after {max_retries} attempts, trying next mirror...")
+                    print(f"[OSM] {mirror} failed after {max_retries} attempt(s), trying next mirror...")
                     break
                 raise e
     if last_exc is not None:
@@ -218,7 +235,7 @@ def fetch_osm_pois(city_name: str, bbox=None) -> pd.DataFrame:
 def fetch_osm_data(city_name: str, bbox=None, network_dist: int = 5000) -> dict:
     """Return {'graph': G|None, 'buildings': GeoDataFrame|None}."""
     ox.settings.timeout = 45
-    ox.settings.max_query_area_size = 25_000_000_000
+    ox.settings.max_query_area_size = 2_500_000_000
 
     result = {"graph": None, "buildings": None}
 

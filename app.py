@@ -276,6 +276,14 @@ with st.sidebar:
         key="city_input",
     )
 
+    if city_size in ("Medium (100k–500k)", "Large (500k+)"):
+        st.info(
+            "⚠️ Large cities (500k+) may overload public Overpass servers — "
+            "analysis can take longer or some layers may time out. For more "
+            "reliable results, try selecting a specific district instead of "
+            "the entire city."
+        )
+
     SIZE_CONFIGS = {
         "Small (< 100k)": {
             "overture_limit": 5000,
@@ -436,13 +444,18 @@ def _run_parallel_fetches(city_name, analysis_bbox, config,
                 fetch_terrain_data, city_name, analysis_bbox, config['terrain_grid'])
 
         results = {}
+        timed_out_keys = []
         for key, future in futures_map.items():
             try:
                 results[key] = future.result(timeout=240)
+            except concurrent.futures.TimeoutError as e:
+                print(f"[parallel] {key} timed out: {e}")
+                results[key] = None
+                timed_out_keys.append(key)
             except Exception as e:
                 print(f"[parallel] {key} failed: {type(e).__name__}: {e}")
                 results[key] = None
-    return results
+    return results, timed_out_keys
 
 
 # ── Analysis pipeline ─────────────────────────────────────────────────────────
@@ -477,7 +490,7 @@ if analyze:
     # Step 2: Fetch all data sources in parallel
     status = st.empty()
     with st.spinner("Fetching all data sources…"):
-        all_data = _run_parallel_fetches(
+        all_data, timed_out_layers = _run_parallel_fetches(
             city_name, analysis_bbox, config,
             run_morph=(run_morphology or run_transport),
             run_transport=run_transport,
@@ -506,6 +519,12 @@ if analyze:
     elif len(poi_df) < 15:
         st.warning("⚠️ Very few POIs found. Results may be incomplete.")
     status.text(f"✅ Data fetched: {len(poi_df):,} POIs")
+
+    if timed_out_layers:
+        st.warning(
+            "Some data layers timed out for this large area. Try selecting "
+            "a smaller zone (district) instead of the entire city."
+        )
 
     graph = None
     buildings_raw = None

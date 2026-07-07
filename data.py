@@ -204,7 +204,8 @@ def fetch_osm_pois(city_name: str, bbox=None) -> pd.DataFrame:
 
     df["category"] = df.apply(_category, axis=1)
 
-    centroids = df.geometry.centroid
+    utm_crs = df.estimate_utm_crs()
+    centroids = df.geometry.to_crs(utm_crs).centroid.to_crs(df.crs)
     df["lat"] = centroids.y
     df["lon"] = centroids.x
 

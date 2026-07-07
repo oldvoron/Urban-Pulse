@@ -305,7 +305,7 @@ with st.sidebar:
     config = SIZE_CONFIGS[city_size]
     st.session_state['config'] = config
 
-    analyze = st.button("Analyze", type="primary", use_container_width=True)
+    analyze = st.button("Analyze", type="primary", width='stretch')
     st.markdown("---")
 
     # Map Layers
@@ -438,9 +438,9 @@ def _run_parallel_fetches(city_name, analysis_bbox, config,
         results = {}
         for key, future in futures_map.items():
             try:
-                results[key] = future.result(timeout=120)
+                results[key] = future.result(timeout=240)
             except Exception as e:
-                print(f"[parallel] {key} failed: {e}")
+                print(f"[parallel] {key} failed: {type(e).__name__}: {e}")
                 results[key] = None
     return results
 
@@ -1212,7 +1212,7 @@ if analyze:
             st.caption("Letter-grade scorecard for each administrative district across five dimensions: transport accessibility, nature access, morphological quality, urban stress, and flood risk. Grades: A (top 25%), B (25–45%), C (45–65%), D (bottom 35%). Source: H3 hex cell metrics spatially joined to OSM administrative boundaries (admin_level 9–10). Minimum 2 hex cells required per district to compute a grade. Districts sorted by overall performance.")
 
             with st.expander("Raw scores table"):
-                st.dataframe(district_scores_df, use_container_width=True)
+                st.dataframe(district_scores_df, width='stretch')
 
             csv_bytes = district_scores_df.to_csv(index=False).encode('utf-8')
             st.download_button(

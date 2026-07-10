@@ -2,6 +2,7 @@ import gc
 import os
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'
 import concurrent.futures
+from math import radians, cos
 import streamlit as st
 import pandas as pd
 import geopandas as gpd
@@ -211,6 +212,14 @@ def get_analysis_bbox(city_name, zone_mode, selected_district, admin_boundaries,
     return None
 
 
+def bbox_area_km2(bbox):
+    """Approximate area of a (min_lon, min_lat, max_lon, max_lat) bbox in km²."""
+    min_lon, min_lat, max_lon, max_lat = bbox
+    lat_km = (max_lat - min_lat) * 111
+    lon_km = (max_lon - min_lon) * 111 * cos(radians((min_lat + max_lat) / 2))
+    return abs(lat_km * lon_km)
+
+
 def clip_to_city(data, city_polygon):
     """
     Clip a GeoDataFrame (spatial clip) or plain DataFrame with lat/lon columns
@@ -275,14 +284,6 @@ with st.sidebar:
         placeholder="e.g. Blois, France",
         key="city_input",
     )
-
-    if city_size in ("Medium (100k–500k)", "Large (500k+)"):
-        st.info(
-            "⚠️ Large cities (500k+) may overload public Overpass servers — "
-            "analysis can take longer or some layers may time out. For more "
-            "reliable results, try selecting a specific district instead of "
-            "the entire city."
-        )
 
     SIZE_CONFIGS = {
         "Small (< 100k)": {
@@ -486,6 +487,17 @@ if analyze:
     analysis_bbox = get_analysis_bbox(
         city_name, zone_mode, selected_district, admin_boundaries, custom_bbox
     )
+
+    MAX_ENTIRE_CITY_AREA_KM2 = 800
+    if zone_mode == "Entire city" and analysis_bbox is not None:
+        area = bbox_area_km2(analysis_bbox)
+        if area > MAX_ENTIRE_CITY_AREA_KM2:
+            st.error(
+                "❌ This city's area is too large for a full-city analysis via "
+                "free Overpass servers. Please select a specific district "
+                f"(detected area: {area:.0f} km², limit: {MAX_ENTIRE_CITY_AREA_KM2} km²)."
+            )
+            st.stop()
 
     # Step 2: Fetch all data sources in parallel
     status = st.empty()
